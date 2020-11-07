@@ -1,0 +1,34 @@
+From 2cac551e585420e07370363cfd55cf11596c6bf2 Mon Sep 17 00:00:00 2001
+From: Jeff Mahoney <jeffm@suse.com>
+Date: Sat, 13 Apr 2019 23:01:18 -0400
+Subject: [PATCH 03/24] python: use utf-8 encoding for gdb_write
+
+Routine print operations end up getting encoding exceptions since
+the default encoding is ascii.  Most systems are using utf-8 now so
+let's use that instead.
+
+This is a hack and we should be looking at the locale.
+
+Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+---
+ gdb/python/python.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/gdb/python/python.c b/gdb/python/python.c
+index bf214fae6e2..14acab6d21f 100644
+--- a/gdb/python/python.c
++++ b/gdb/python/python.c
+@@ -1110,8 +1110,8 @@ gdbpy_write (PyObject *self, PyObject *args, PyObject *kw)
+   static const char *keywords[] = { "text", "stream", NULL };
+   int stream_type = 0;
+ 
+-  if (!gdb_PyArg_ParseTupleAndKeywords (args, kw, "s|i", keywords, &arg,
+-					&stream_type))
++  if (!gdb_PyArg_ParseTupleAndKeywords (args, kw, "es|i", keywords, "utf-8",
++					&arg, &stream_type))
+     return NULL;
+ 
+   try
+-- 
+2.26.2
+

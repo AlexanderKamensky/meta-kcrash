@@ -1,0 +1,34 @@
+From 5da6a0934592c43d5bd37bf7799b7010d3f72420 Mon Sep 17 00:00:00 2001
+From: Jeff Mahoney <jeffm@suse.com>
+Date: Sat, 13 Apr 2019 22:59:24 -0400
+Subject: [PATCH 02/24] gdb: properly zero out memory used for fields when
+ allocated
+
+The memory allocated for fields in process_enumeration_scope is extended
+with a xrealloc call in chunks but the memory is never fully initialized
+and the fields are only partially written.  We then copy only the written
+fields into the type, where later we assume everything was initialized
+properly.  This mostly works until we want to do deep type comparison
+and the type comparison fails.
+
+Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+---
+ gdb/dwarf2read.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/gdb/dwarf2read.c b/gdb/dwarf2read.c
+index cc5bb00c5ff..c820a7e02a4 100644
+--- a/gdb/dwarf2read.c
++++ b/gdb/dwarf2read.c
+@@ -16485,6 +16485,8 @@ process_enumeration_scope (struct die_info *die, struct dwarf2_cu *cu)
+ 			xrealloc (fields,
+ 				  (num_fields + DW_FIELD_ALLOC_CHUNK)
+ 				  * sizeof (struct field));
++		      memset (fields + num_fields, 0,
++			      DW_FIELD_ALLOC_CHUNK * sizeof(struct field));
+ 		    }
+ 
+ 		  FIELD_NAME (fields[num_fields]) = sym->linkage_name ();
+-- 
+2.26.2
+

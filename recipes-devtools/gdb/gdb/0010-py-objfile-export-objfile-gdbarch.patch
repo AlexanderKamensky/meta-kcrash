@@ -1,0 +1,73 @@
+From 52f831a2dba9d38854556462c80448a4e17f6bda Mon Sep 17 00:00:00 2001
+From: Jeff Mahoney <jeffm@suse.com>
+Date: Sat, 13 Apr 2019 23:05:03 -0400
+Subject: [PATCH 10/24] py-objfile: export objfile gdbarch
+
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ gdb/doc/python.texi     |  7 +++++++
+ gdb/python/py-objfile.c | 23 +++++++++++++++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/gdb/doc/python.texi b/gdb/doc/python.texi
+index 8240cd10092..a94224aeeee 100644
+--- a/gdb/doc/python.texi
++++ b/gdb/doc/python.texi
+@@ -4410,6 +4410,13 @@ The @code{frame_filters} attribute is a dictionary of frame filter
+ objects.  @xref{Frame Filter API}, for more information.
+ @end defvar
+ 
++@defvar Objfile.architecture
++The @code{gdb.Architecture} of the objfile.
++
++The value is @code{None} if the objfile is no longer valid.
++See the @code{gdb.Objfile.is_valid} method, described below.
++@end defvar
++
+ One may add arbitrary attributes to @code{gdb.Objfile} objects
+ in the usual Python way.
+ This is useful if, for example, one needs to do some extra record keeping
+diff --git a/gdb/python/py-objfile.c b/gdb/python/py-objfile.c
+index 942349d6e66..4074b4e50a0 100644
+--- a/gdb/python/py-objfile.c
++++ b/gdb/python/py-objfile.c
+@@ -362,6 +362,27 @@ objfpy_get_xmethods (PyObject *o, void *ignore)
+   return self->xmethods;
+ }
+ 
++static PyObject *
++objfpy_get_architecture (PyObject *o, void *ignore)
++{
++  objfile_object *obj = (objfile_object *) o;
++  struct gdbarch *gdbarch = NULL;
++
++  if (!obj->objfile)
++    Py_RETURN_NONE;
++
++  try
++    {
++      gdbarch = get_objfile_arch(obj->objfile);
++    }
++  catch (const gdb_exception &except)
++    {
++      GDB_PY_HANDLE_EXCEPTION (except);
++    }
++
++  return gdbarch_to_arch_object (gdbarch);
++}
++
+ /* Set the 'type_printers' attribute.  */
+ 
+ static int
+@@ -757,6 +778,8 @@ static gdb_PyGetSetDef objfile_getset[] =
+     "Type printers.", NULL },
+   { "xmethods", objfpy_get_xmethods, NULL,
+     "Debug methods.", NULL },
++  { "architecture", objfpy_get_architecture, NULL, "Objfile Architecture",
++    NULL },
+   { NULL }
+ };
+ 
+-- 
+2.26.2
+

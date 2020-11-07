@@ -1,0 +1,143 @@
+From 3996793325e633820a20af492b69da2462028b98 Mon Sep 17 00:00:00 2001
+From: Jeff Mahoney <jeffm@suse.com>
+Date: Tue, 12 Jan 2016 16:22:02 -0500
+Subject: [PATCH 06/24] py-value: properly handle unsigned and pointer types
+
+GDB passes signed long values into python whether they're signed or
+not.  This results in a situation where the caller needs to convert
+it back to an unsigned value, which requires knowledge of the underlying
+size of the value.  The information to do that is available in the API,
+but it's unnecessary.  We know it's an unsigned value so pass it as
+an unsigned value.
+---
+ gdb/doc/python.texi                   | 13 +++++++++++--
+ gdb/python/py-value.c                 | 12 ++++++++++--
+ gdb/testsuite/gdb.python/py-value.exp | 23 +++++++++++++++++++++++
+ 3 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/gdb/doc/python.texi b/gdb/doc/python.texi
+index d50205b31b2..1e00a959e5e 100644
+--- a/gdb/doc/python.texi
++++ b/gdb/doc/python.texi
+@@ -577,8 +577,9 @@ for its internal bookkeeping of the inferior's values, and for
+ fetching values when necessary.
+ 
+ Inferior values that are simple scalars can be used directly in
+-Python expressions that are valid for the value's data type.  Here's
+-an example for an integer or floating-point value @code{some_val}:
++Python expressions that are valid for the value's data type.  Signedness
++is be preserved from the value. Here's an example for an integer or
++floating-point value @code{some_val}:
+ 
+ @smallexample
+ bar = some_val + 2
+@@ -599,6 +600,14 @@ as follows:
+ val3 = val1 + val2
+ @end smallexample
+ 
++@noindent
++In C-like languages, one can convert the target address of pointer types
++for use in Python as unsigned long values as follows:
++
++@smallexample
++val = long(some_val)
++@end smallexample
++
+ @noindent
+ The result of the operation @code{val3} is also a @code{gdb.Value}
+ object corresponding to the value returned by the overloaded @code{+}
+diff --git a/gdb/python/py-value.c b/gdb/python/py-value.c
+index 497696a7d3a..04ceae5f680 100644
+--- a/gdb/python/py-value.c
++++ b/gdb/python/py-value.c
+@@ -1673,6 +1673,7 @@ valpy_int (PyObject *self)
+ {
+   struct value *value = ((value_object *) self)->value;
+   struct type *type = value_type (value);
++  int is_unsigned = 0;
+   LONGEST l = 0;
+ 
+   try
+@@ -1687,6 +1688,9 @@ valpy_int (PyObject *self)
+ 	  && TYPE_CODE (type) != TYPE_CODE_PTR)
+ 	error (_("Cannot convert value to int."));
+ 
++      if (TYPE_CODE (type) == TYPE_CODE_PTR ||
++	  TYPE_UNSIGNED (type))
++	is_unsigned = 1;
+       l = value_as_long (value);
+     }
+   catch (const gdb_exception &except)
+@@ -1694,7 +1698,7 @@ valpy_int (PyObject *self)
+       GDB_PY_HANDLE_EXCEPTION (except);
+     }
+ 
+-  if (TYPE_UNSIGNED (type))
++  if (is_unsigned)
+     return gdb_py_object_from_ulongest (l).release ();
+   else
+     return gdb_py_object_from_longest (l).release ();
+@@ -1707,6 +1711,7 @@ valpy_long (PyObject *self)
+ {
+   struct value *value = ((value_object *) self)->value;
+   struct type *type = value_type (value);
++  int is_unsigned = 0;
+   LONGEST l = 0;
+ 
+   try
+@@ -1723,6 +1728,9 @@ valpy_long (PyObject *self)
+ 	  && TYPE_CODE (type) != TYPE_CODE_PTR)
+ 	error (_("Cannot convert value to long."));
+ 
++      if (TYPE_CODE (type) == TYPE_CODE_PTR ||
++	  TYPE_UNSIGNED (type))
++	is_unsigned = 1;
+       l = value_as_long (value);
+     }
+   catch (const gdb_exception &except)
+@@ -1730,7 +1738,7 @@ valpy_long (PyObject *self)
+       GDB_PY_HANDLE_EXCEPTION (except);
+     }
+ 
+-  if (TYPE_UNSIGNED (type))
++  if (is_unsigned)
+     return gdb_py_long_from_ulongest (l);
+   else
+     return gdb_py_long_from_longest (l);
+diff --git a/gdb/testsuite/gdb.python/py-value.exp b/gdb/testsuite/gdb.python/py-value.exp
+index cfd27de0fb1..b99565c5105 100644
+--- a/gdb/testsuite/gdb.python/py-value.exp
++++ b/gdb/testsuite/gdb.python/py-value.exp
+@@ -122,6 +122,29 @@ proc test_value_numeric_ops {} {
+   gdb_test_no_output "python evalue = gdb.history (0)"
+   gdb_test "python print (int (evalue))" "2"
+ 
++  # Implicit and explicit conversions to long
++  gdb_test "print (unsigned long long) -1" ".*" ""
++  gdb_test_no_output "python x = gdb.history (0)" ""
++  gdb_test "python print x" "18446744073709551615" "print unsigned long long value"
++  gdb_test "python print long(x)" "18446744073709551615" "print unsigned long long value as Python long"
++
++  gdb_test "print (long long) -1" ".*" ""
++  gdb_test_no_output "python x = gdb.history (0)" ""
++  gdb_test "python print x" "-1" "print long long value"
++  gdb_test "python print long(x)" "-1" "print long long value as Python long"
++
++  set pointer_size [get_sizeof "char *" 99]
++
++  gdb_test "print (void *) -1" ".*" ""
++  gdb_test_no_output "python c = gdb.history (0)" ""
++  if {$pointer_size == 8} {
++    gdb_test "python print c" "0xffffffffffffffff" "print pointer"
++    gdb_test "python print long(c)" "18446744073709551615" "print pointer as Python long"
++  } elseif {$pointer_size == 4} {
++    gdb_test "python print c" "0xffffffff" "print pointer"
++    gdb_test "python print long(c)" "4294967295" "print pointer as Python long"
++  }
++
+   # Test pointer arithmethic
+ 
+   # First, obtain the pointers
+-- 
+2.26.2
+

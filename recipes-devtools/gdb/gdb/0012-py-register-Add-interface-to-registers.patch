@@ -1,0 +1,724 @@
+From 9d6efc9714fd3b6e1ec5d0257cfacb801e4bd010 Mon Sep 17 00:00:00 2001
+From: Jeff Mahoney <jeffm@suse.com>
+Date: Wed, 18 Mar 2020 11:07:42 -0400
+Subject: [PATCH 12/24] py-register: Add interface to registers
+
+This patch adds new a gdb.Register object to access the register cache
+associated with a thread.  Registers may not be created independently but
+may be accessed via the gdb.InferiorThread.registers dictionary.  Registers
+are invalidated when the thread exits much like symbols are invalidated
+when an objfile is unloaded.
+---
+ gdb/Makefile.in                          |   1 +
+ gdb/doc/python.texi                      |  47 +++
+ gdb/python/py-infthread.c                |  52 ++++
+ gdb/python/py-register.c                 | 374 +++++++++++++++++++++++
+ gdb/python/python-internal.h             |  13 +
+ gdb/python/python.c                      |   3 +-
+ gdb/testsuite/gdb.python/py-register.c   |  19 ++
+ gdb/testsuite/gdb.python/py-register.exp |  59 ++++
+ 8 files changed, 567 insertions(+), 1 deletion(-)
+ create mode 100644 gdb/python/py-register.c
+ create mode 100644 gdb/testsuite/gdb.python/py-register.c
+ create mode 100644 gdb/testsuite/gdb.python/py-register.exp
+
+diff --git a/gdb/Makefile.in b/gdb/Makefile.in
+index 6eecb4404fc..16688bf84d0 100644
+--- a/gdb/Makefile.in
++++ b/gdb/Makefile.in
+@@ -397,6 +397,7 @@ SUBDIR_PYTHON_SRCS = \
+ 	python/py-record.c \
+ 	python/py-record-btrace.c \
+ 	python/py-record-full.c \
++	python/py-register.c \
+ 	python/py-signalevent.c \
+ 	python/py-stopevent.c \
+ 	python/py-symbol.c \
+diff --git a/gdb/doc/python.texi b/gdb/doc/python.texi
+index 0d444d8407a..cd411145c3b 100644
+--- a/gdb/doc/python.texi
++++ b/gdb/doc/python.texi
+@@ -158,6 +158,7 @@ optional arguments while skipping others.  Example:
+ * Symbols In Python::           Python representation of symbols.
+ * Minimal Symbols In Python::   Python representation of minimal symbols.
+ * Symbol Tables In Python::     Python representation of symbol tables.
++* Registers in Python::		Python representation of CPU registers.
+ * Line Tables In Python::       Python representation of line tables.
+ * Breakpoints In Python::       Manipulating breakpoints using Python.
+ * Finish Breakpoints in Python:: Setting Breakpoints on function return
+@@ -3342,6 +3343,13 @@ The inferior this thread belongs to.  This attribute is represented as
+ a @code{gdb.Inferior} object.  This attribute is not writable.
+ @end defvar
+ 
++@defvar InferiorThread.registers
++Return a dictionary of registers associated with this thread.  The dictionary
++is not writable but the values of the registers it contains may be writable
++depending on the target.  Writing to the register values will update them
++similar to using the @code{set $register} @value{GDBN} command.
++@end defvar
++
+ A @code{gdb.InferiorThread} object has the following methods:
+ 
+ @defun InferiorThread.is_valid ()
+@@ -5248,6 +5256,45 @@ This type represents the static version of gdb.MINSYMBOL_TYPE_DATA.
+ This type represents the static version of gdb.MINSYMBOL_TYPE_BSS.
+ @end vtable
+ 
++@node Registers in Python
++@subsubsection Python representation of CPU registers
++
++@cindex registers in python
++@tindex gdb.Register
++
++@value{GDBN} represents CPU registers associated with threads as a @code{gdb.Register} object in Python.
++
++A @code{gdb.Register} object has the following attributes:
++
++@defvar Register.name
++The architecture-defined name for the register.  This attribute is not writable.
++@end defvar
++
++@defvar Register.value
++The value that this register contains.  This attribute is writable.  The value
++assigned to the register must be of sufficient size and compatible with the
++@code{Register.type} or a TypeError exception will be raised.  Integers, longs,
++bytearray objects, and @code{gdb.Value} objects are accepted.  @value{GDBN}
++will attempt to automatically cast a supplied @code{gdb.Value} object to the
++register type.  Providing None marks the register as containing and
++undefined value.
++@end defvar
++
++@defvar Register.size
++The size of the register in bytes.  Most general purpose registers will
++have a size that matches the size of a long integer on the target
++architecture.  Special-purpose registers can have arbitary lengths.  This
++attribute is not writable.
++@end defvar
++
++@defvar Register.regnum
++The architecture-dependent register number.  This attribute is not writable.
++@end defvar
++
++@defvar Register.type
++The type that this register represents.  This attribute is not writable.
++@end defvar
++
+ @node Symbol Tables In Python
+ @subsubsection Symbol table representation in Python
+ 
+diff --git a/gdb/python/py-infthread.c b/gdb/python/py-infthread.c
+index f350e367d5e..cac93893f8f 100644
+--- a/gdb/python/py-infthread.c
++++ b/gdb/python/py-infthread.c
+@@ -18,6 +18,7 @@
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+ 
+ #include "defs.h"
++#include "gdbarch.h"
+ #include "gdbthread.h"
+ #include "inferior.h"
+ #include "python-internal.h"
+@@ -51,6 +52,7 @@ create_thread_object (struct thread_info *tp)
+ 
+   thread_obj->thread = tp;
+   thread_obj->inf_obj = (PyObject *) inf_obj.release ();
++  thread_obj->register_objs = NULL;
+ 
+   return thread_obj;
+ }
+@@ -58,6 +60,8 @@ create_thread_object (struct thread_info *tp)
+ static void
+ thpy_dealloc (PyObject *self)
+ {
++  del_thread_registers ((thread_object *) self);
++
+   Py_DECREF (((thread_object *) self)->inf_obj);
+   Py_TYPE (self)->tp_free (self);
+ }
+@@ -286,6 +290,52 @@ thpy_thread_handle (PyObject *self, PyObject *args)
+   return object;
+ }
+ 
++static PyObject *
++thpy_get_registers (PyObject *self, void *closure)
++{
++  thread_object *thread_obj = (thread_object *) self;
++  PyObject *d = NULL;
++
++  THPY_REQUIRE_VALID (thread_obj);
++
++  try
++    {
++      struct gdbarch *gdbarch;
++      int i, numregs;
++      gdbarch = target_gdbarch ();
++      numregs = gdbarch_num_regs (gdbarch);
++
++      d = PyDict_New();
++      for (i = 0; i < numregs; i++)
++	{
++	  PyObject *reg;
++	  const char *name = gdbarch_register_name (gdbarch, i);
++
++	  if (!name || !*name)
++		  continue;
++
++	  reg = register_to_register_object (thread_obj, i);
++	  if (!reg) {
++	    Py_DECREF (d);
++	    return NULL;
++	  }
++
++	  if (PyDict_SetItemString (d, name, reg)) {
++	    Py_DECREF (reg);
++	    Py_DECREF (d);
++	    return NULL;
++	  }
++	}
++    }
++  catch (const gdb_exception &except)
++    {
++      GDB_PY_HANDLE_EXCEPTION (except);
++    }
++
++    /* Does this leak d? */
++    return PyDictProxy_New(d);
++}
++
+ /* Return a reference to a new Python object representing a ptid_t.
+    The object is a tuple containing (pid, lwp, tid). */
+ PyObject *
+@@ -344,6 +394,8 @@ static gdb_PyGetSetDef thread_object_getset[] =
+     NULL },
+   { "inferior", thpy_get_inferior, NULL,
+     "The Inferior object this thread belongs to.", NULL },
++  { "registers", thpy_get_registers, NULL, "Registers for this thread.",
++    NULL },
+ 
+   { NULL }
+ };
+diff --git a/gdb/python/py-register.c b/gdb/python/py-register.c
+new file mode 100644
+index 00000000000..fe14ae46572
+--- /dev/null
++++ b/gdb/python/py-register.c
+@@ -0,0 +1,374 @@
++#include "defs.h"
++#include "python-internal.h"
++#include "gdbarch.h"
++#include "gdbthread.h"
++#include "regcache.h"
++#include "target.h"
++
++extern PyTypeObject register_object_type;
++
++typedef struct register_object {
++  PyObject_HEAD
++  thread_object *thread;
++  int regnum;
++  struct register_object *next;
++  struct register_object *prev;
++} register_object;
++
++#define REGPY_REQUIRE_VALID(register_obj, reg, ret)		\
++  do {								\
++    reg = register_object_to_register(register_obj);		\
++    if (reg == NULL)						\
++      {								\
++	PyErr_SetString (PyExc_RuntimeError,			\
++			 _("Register is invalid."));		\
++	return ret;						\
++      }								\
++  } while(0)
++
++static void
++set_register(register_object *obj, thread_object *thread_obj, int regnum)
++{
++  obj->thread = thread_obj;
++  obj->regnum = regnum;
++  obj->prev = NULL;
++  obj->next = (register_object *)thread_obj->register_objs;
++  if (obj->next)
++    obj->next->prev = obj;
++  thread_obj->register_objs = (PyObject *)obj;
++}
++
++PyObject *
++register_to_register_object (thread_object *thread_obj, int reg)
++{
++  register_object *register_obj;
++
++  register_obj = PyObject_New (register_object, &register_object_type);
++  if (register_obj)
++    set_register (register_obj, thread_obj, reg);
++  return (PyObject *) register_obj;
++
++}
++
++static register_object *
++register_object_to_register (PyObject *obj)
++{
++  register_object *reg;
++  if (! PyObject_TypeCheck (obj, &register_object_type))
++    return NULL;
++  reg = (register_object *) obj;
++  if (!reg->thread)
++    return NULL;
++  return reg;
++}
++
++static PyObject *
++register_get_name(PyObject *self, void *closure)
++{
++  register_object *obj;
++  const char *name = NULL;
++
++  REGPY_REQUIRE_VALID(self, obj, NULL);
++  try
++    {
++      struct gdbarch *gdbarch = target_gdbarch();
++      name = gdbarch_register_name (gdbarch, obj->regnum);
++    }
++  catch (const gdb_exception &except)
++    {
++      GDB_PY_HANDLE_EXCEPTION (except);
++    }
++
++  return PyString_FromString(name);
++}
++
++static PyObject *
++register_get_value(PyObject *self, void *closure)
++{
++  register_object *obj;
++  struct value *value = NULL;
++
++  REGPY_REQUIRE_VALID(self, obj, NULL);
++
++  try
++    {
++      struct gdbarch *gdbarch = target_gdbarch ();
++      struct thread_info *ti = obj->thread->thread;
++      struct regcache *regcache = get_thread_regcache (ti->ptid);
++      if (obj->regnum == gdbarch_pc_regnum (gdbarch))
++	{
++	  CORE_ADDR pc = regcache_read_pc (regcache);
++	  value = allocate_value (register_type (gdbarch, obj->regnum));
++
++	  VALUE_LVAL (value) = lval_register;
++	  VALUE_REGNUM (value) = obj->regnum;
++	  memcpy (value_contents_raw (value), &pc, sizeof (pc));
++	}
++      else
++	{
++	  /*
++	   * We don't want raw read since that expects to
++	   * read it from the core file
++	   */
++	  value = regcache->cooked_read_value (obj->regnum);
++	}
++    }
++  catch (const gdb_exception &except)
++    {
++      GDB_PY_HANDLE_EXCEPTION (except);
++    }
++
++  return value_to_value_object(value);
++}
++
++static const char *
++type_prefix (struct type *type)
++{
++  switch (TYPE_CODE(type))
++    {
++      case TYPE_CODE_UNION:
++	return "union ";
++      case TYPE_CODE_STRUCT:
++	return "struct ";
++      case TYPE_CODE_ENUM:
++	return "enum ";
++      }
++
++    return "";
++}
++
++static int
++check_size (size_t len, size_t size)
++{
++  if (len < size)
++    {
++      PyErr_Format (PyExc_TypeError,
++		    "Value must be at least %zd bytes in size.", size);
++      return -1;
++    }
++  return 0;
++}
++
++static int
++write_register (struct regcache *regcache, int reg, const void *data)
++{
++  struct gdbarch *gdbarch = target_gdbarch ();
++  if (target_has_execution && reg == gdbarch_pc_regnum (gdbarch) && data)
++    {
++      CORE_ADDR pc = *(CORE_ADDR *)data;
++      regcache_write_pc (regcache, pc);
++    }
++  else
++    regcache->raw_supply (reg, data);
++
++  return 0;
++}
++
++static int
++register_set_value(PyObject *self, PyObject *value_obj, void *closure)
++{
++  struct type *type = NULL;
++  register_object *obj;
++  int ret = -1;
++
++  REGPY_REQUIRE_VALID(self, obj, -1);
++
++  try
++    {
++      struct gdbarch *gdbarch = target_gdbarch ();
++      size_t size = register_size (gdbarch, obj->regnum);
++      struct thread_info *ti = obj->thread->thread;
++      struct regcache *regcache = get_thread_regcache_for_ptid(ti->ptid);
++      struct value *value;
++      unsigned long ul_value;
++
++      type = register_type (gdbarch, obj->regnum);
++
++      if (value_obj == Py_None)
++	ret = write_register (regcache, obj->regnum, NULL);
++      else if (PyByteArray_Check (value_obj))
++        {
++	  Py_ssize_t len = PyByteArray_Size (value_obj);
++	  char *buf = PyByteArray_AsString (value_obj);
++	  if (!check_size (len, size))
++	    ret = write_register (regcache, obj->regnum, buf);
++	}
++      else if (PyLong_Check (value_obj))
++	{
++	  ul_value = PyLong_AsUnsignedLong (value_obj);
++
++	  if (!check_size (sizeof (ul_value), size))
++	    {
++	      /* Let the value code do the type checking */
++	      value = value_from_ulongest (type, ul_value);
++	      ret = write_register (regcache, obj->regnum, &ul_value);
++	    }
++	}
++#ifndef IS_PY3K
++      else if (PyInt_Check (value_obj))
++	{
++	  ul_value = PyInt_AsUnsignedLongMask (value_obj);
++
++	  if (!check_size (sizeof (ul_value), size))
++	    {
++	      /* Let the value code do the type checking */
++	      value = value_from_ulongest (type, ul_value);
++	      ret = write_register (regcache, obj->regnum, &ul_value);
++	    }
++	}
++#endif
++      else
++	{
++	  value = value_object_to_value(value_obj);
++	  if (value)
++	    {
++	      value = value_cast (type, value);
++	      ret = write_register (regcache, obj->regnum,
++				    value_contents (value));
++	    }
++	  else
++	    PyErr_Format (PyExc_TypeError,
++		      "Value must be int, long, bytearray, or gdb.Value and convertible to `%s%s'",
++		      type_prefix (type), TYPE_NAME (type));
++	}
++    }
++  catch (const gdb_exception &except)
++    {
++      GDB_PY_SET_HANDLE_EXCEPTION (except);
++    }
++
++  return ret;
++}
++
++static PyObject *
++register_get_size(PyObject *self, void *closure)
++{
++  register_object *obj;
++  int size = 0;
++
++  REGPY_REQUIRE_VALID(self, obj, NULL);
++
++  try
++    {
++      struct gdbarch *gdbarch = target_gdbarch();
++      size = register_size (gdbarch, obj->regnum);
++    }
++  catch (const gdb_exception &except)
++    {
++      GDB_PY_HANDLE_EXCEPTION (except);
++    }
++
++  return PyInt_FromLong(size);
++}
++
++static PyObject *
++register_get_regnum(PyObject *self, void *closure)
++{
++  register_object *obj;
++  REGPY_REQUIRE_VALID(self, obj, NULL);
++
++  return PyInt_FromLong(obj->regnum);
++}
++
++static PyObject *
++register_get_regtype(PyObject *self, void *closure)
++{
++  register_object *obj;
++  struct type *type = NULL;
++
++  REGPY_REQUIRE_VALID(self, obj, NULL);
++
++  try
++    {
++      struct gdbarch *gdbarch = target_gdbarch ();
++      type = register_type (gdbarch, obj->regnum);
++    }
++  catch (const gdb_exception &except)
++    {
++      GDB_PY_HANDLE_EXCEPTION (except);
++    }
++
++  return type_to_type_object(type);
++}
++
++static void
++register_object_dealloc (PyObject *self)
++{
++  register_object *reg = (register_object *) self;
++
++  if (reg->prev)
++	  reg->prev->next = reg->next;
++  else if (reg->thread)
++    reg->thread->register_objs = (PyObject *)reg->next;
++
++  if (reg->next)
++	  reg->next->prev = reg->prev;
++}
++
++void
++del_thread_registers (thread_object *thread)
++{
++  register_object *obj = (register_object *) thread->register_objs;
++
++  while (obj)
++    {
++      register_object *next = obj->next;
++
++      obj->thread = NULL;
++      obj->prev = NULL;
++      obj->next = NULL;
++
++      obj = next;
++    }
++}
++
++static gdb_PyGetSetDef register_object_getset[] = {
++  { "name", register_get_name, NULL, "Register name.", NULL },
++  { "value", register_get_value, register_set_value, "Register value.", NULL },
++  { "size", register_get_size, NULL, "Register size.", NULL },
++  { "regnum", register_get_regnum, NULL, "Register number.", NULL },
++  { "type", register_get_regtype, NULL, "Register type.", NULL },
++  { NULL }  /* Sentinal */
++};
++
++PyTypeObject register_object_type = {
++  PyVarObject_HEAD_INIT (NULL, 0)
++  "gdb.Register",		  /*tp_name*/
++  sizeof(register_object),	  /*tp_basicsize*/
++  0,				  /*tp_itemsize*/
++  register_object_dealloc,	  /*tp_delalloc*/
++  0,				  /*tp_print*/
++  0,				  /*tp_getattr*/
++  0,				  /*tp_setattr*/
++  0,				  /*tp_compare*/
++  0,				  /*tp_repr*/
++  0,				  /*tp_as_number*/
++  0,				  /*tp_as_sequence*/
++  0,				  /*tp_as_mapping*/
++  0,				  /*tp_hash */
++  0,				  /*tp_call*/
++  0,				  /*tp_str*/
++  0,				  /*tp_getattro*/
++  0,				  /*tp_setattro*/
++  0,				  /*tp_as_buffer*/
++  Py_TPFLAGS_DEFAULT,		  /*tp_flags*/
++  "GDB Register object",	  /* tp_doc */
++  0,				  /* tp_traverse */
++  0,				  /* tp_clear */
++  0,				  /* tp_richcompare */
++  0,				  /* tp_weaklistoffset */
++  0,				  /* tp_iter */
++  0,				  /* tp_iternext */
++  0,	  			  /* tp_methods */
++  0,				  /* tp_members */
++  register_object_getset,	  /* tp_getset */
++};
++
++int gdbpy_initialize_register (void)
++{
++    if (PyType_Ready (&register_object_type) < 0)
++      return -1;
++
++    return (gdb_pymodule_addobject(gdb_module, "Register",
++			       (PyObject *)&register_object_type));
++}
+diff --git a/gdb/python/python-internal.h b/gdb/python/python-internal.h
+index 15c9ec54e8c..38a5f6f4877 100644
+--- a/gdb/python/python-internal.h
++++ b/gdb/python/python-internal.h
+@@ -376,8 +376,17 @@ typedef struct
+   /* The thread we represent.  */
+   struct thread_info *thread;
+ 
++  /* Regcache */
++  PyObject *regcache;
++
+   /* The Inferior object to which this thread belongs.  */
+   PyObject *inf_obj;
++
++  /*
++   * Registers associated with this thread.  Python code may hold outstanding
++   * references and we need to be able to mark them invalid.
++   */
++  PyObject *register_objs;
+ } thread_object;
+ 
+ struct inferior_object;
+@@ -550,6 +559,8 @@ int gdbpy_initialize_xmethods (void)
+   CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
+ int gdbpy_initialize_unwind (void)
+   CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
++int gdbpy_initialize_register (void)
++  CPYCHECKER_NEGATIVE_RESULT_SETS_EXCEPTION;
+ 
+ /* A wrapper for PyErr_Fetch that handles reference counting for the
+    caller.  */
+@@ -774,4 +785,6 @@ struct Py_buffer_deleter
+ /* A unique_ptr specialization for Py_buffer.  */
+ typedef std::unique_ptr<Py_buffer, Py_buffer_deleter> Py_buffer_up;
+ 
++PyObject *register_to_register_object (thread_object *thread_obj, int reg);
++void del_thread_registers (thread_object *thread);
+ #endif /* PYTHON_PYTHON_INTERNAL_H */
+diff --git a/gdb/python/python.c b/gdb/python/python.c
+index bea1f0e43e1..60453e6ab96 100644
+--- a/gdb/python/python.c
++++ b/gdb/python/python.c
+@@ -1687,7 +1687,8 @@ do_start_initialization ()
+       || gdbpy_initialize_event () < 0
+       || gdbpy_initialize_arch () < 0
+       || gdbpy_initialize_xmethods () < 0
+-      || gdbpy_initialize_unwind () < 0)
++      || gdbpy_initialize_unwind () < 0
++      || gdbpy_initialize_register () < 0)
+     return false;
+ 
+ #define GDB_PY_DEFINE_EVENT_TYPE(name, py_name, doc, base)	\
+diff --git a/gdb/testsuite/gdb.python/py-register.c b/gdb/testsuite/gdb.python/py-register.c
+new file mode 100644
+index 00000000000..413b1827c48
+--- /dev/null
++++ b/gdb/testsuite/gdb.python/py-register.c
+@@ -0,0 +1,19 @@
++/* So we have a data section */
++const char foo[] = "somestring";
++
++asm("\
++.section .text\n\
++.global text_msym\n\
++text_msym:\n\
++	.byte 0\n\
++.section .data\n\
++.globl data_msym\n\
++data_msym:\n\
++	.asciz \"minsym text\"\n\
++");
++
++int
++main(void)
++{
++	return 0;
++}
+diff --git a/gdb/testsuite/gdb.python/py-register.exp b/gdb/testsuite/gdb.python/py-register.exp
+new file mode 100644
+index 00000000000..b18de66ee5c
+--- /dev/null
++++ b/gdb/testsuite/gdb.python/py-register.exp
+@@ -0,0 +1,59 @@
++# Copyright (C) 2010-2015 Free Software Foundation, Inc.
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++# This file is part of the GDB testsuite.  It tests the mechanism
++# exposing values to Python.
++
++load_lib gdb-python.exp
++
++#set verbose 10
++
++standard_testfile
++
++if {[prepare_for_testing $testfile.exp $testfile $srcfile debug]} {
++    return -1
++}
++
++# Skip all tests if Python scripting is not enabled.
++if { [skip_python_tests] } { continue }
++
++if ![runto_main] then {
++    fail "Can't run to main"
++    return 0
++}
++
++#gdb_py_test_silent_cmd
++gdb_py_test_silent_cmd "python regs = gdb.selected_thread().registers"  "Keep a set of registers" 1
++
++# Hopefully an architecture-independent way of finding a GPR to test; Reg #0
++gdb_py_test_silent_cmd "python gpr0 = sorted(regs.values(), key=lambda x: x.regnum)\[0\]" "saving the name of GPR#0" 1
++gdb_test "python print gpr0" "<gdb.Register object at.*" "Test to get a register"
++gdb_py_test_silent_cmd "python gpr0.value = 1" "Test assignment to GPR" 1
++gdb_test_multiple "python gpr0.value = \"oh hai\"" "Test assignment to GPR of invalid type" {
++    -re "Traceback.*TypeError:.*$gdb_prompt $" {
++	pass "1"
++    }
++}
++
++gdb_test_multiple "python regs\[\'foo\'\] = 0" "Testing that register dict is static (writing)" {
++    -re "Traceback.*TypeError:.*$gdb_prompt $" {
++	pass "1"
++    }
++}
++gdb_test_multiple "python print regs\[\'foo\'\]" "Testing that register dict is static (reading)" {
++    -re "Traceback.*KeyError:.*$gdb_prompt $" {
++	pass "1"
++    }
++}
+-- 
+2.26.2
+

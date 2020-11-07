@@ -1,0 +1,29 @@
+From b06032a0bf7ed3e488a9256510c060c68539680f Mon Sep 17 00:00:00 2001
+From: Jeff Mahoney <jeffm@suse.com>
+Date: Tue, 12 Jan 2016 16:21:07 -0500
+Subject: [PATCH 01/24] check_types_equal: short circuit check if identical
+ pointers are used
+
+If two types share identical pointers, we don't need to check typedefs
+before comparing the result.
+---
+ gdb/gdbtypes.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/gdb/gdbtypes.c b/gdb/gdbtypes.c
+index 4c755157317..3c29e7f4fb6 100644
+--- a/gdb/gdbtypes.c
++++ b/gdb/gdbtypes.c
+@@ -3708,6 +3708,9 @@ static bool
+ check_types_equal (struct type *type1, struct type *type2,
+ 		   std::vector<type_equality_entry> *worklist)
+ {
++  if (type1 == type2)
++    return 1;
++
+   type1 = check_typedef (type1);
+   type2 = check_typedef (type2);
+ 
+-- 
+2.26.2
+

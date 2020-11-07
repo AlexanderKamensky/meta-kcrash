@@ -1,0 +1,32 @@
+From 2ab673046d2f22317793c8d6efe15de5585fff37 Mon Sep 17 00:00:00 2001
+From: Jeff Mahoney <jeffm@suse.com>
+Date: Mon, 22 Apr 2019 21:43:43 -0400
+Subject: [PATCH 21/24] py-type: use non-deep comparison for typy_richcompare
+
+When comparing types representing the same type from different sources,
+we suck down a ton of CPU.
+
+The right fix is probably something like type aliasing, but this is
+a cheap solution for now.
+---
+ gdb/python/py-type.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/gdb/python/py-type.c b/gdb/python/py-type.c
+index b7700aed583..70b1b2197e7 100644
+--- a/gdb/python/py-type.c
++++ b/gdb/python/py-type.c
+@@ -1019,7 +1019,10 @@ typy_richcompare (PyObject *self, PyObject *other, int op)
+     {
+       try
+ 	{
++	  result = types_equal (type1, type2);
++#if 0
+ 	  result = types_deeply_equal (type1, type2);
++#endif
+ 	}
+       catch (const gdb_exception &except)
+ 	{
+-- 
+2.26.2
+
