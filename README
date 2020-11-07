@@ -1,0 +1,89 @@
+This README file contains information on the contents of the meta-kcrash layer.
+This layer effectively brings crash-python tool to openembedded enviornment.
+Crash-python tool is modern replacement for crash tool that is to investigate linux kernel dump files.
+Crash-python advantage over crash tool is that implemented as addition to modern gdb and can support various extensions
+implemented in regular python code running inside of gdb.
+
+Naturally it brings dependencies of crash-python tool:
+  - gdb-python: set of additional patches that brings additional python captablities to standard gdb
+  - libkdumpfile: Library that can read kernel dump file.
+
+Currently supported archiceture is x86_64. Work on supporting other archicetures is in progress.
+
+Please see the corresponding sections below for details.
+
+Dependencies
+============
+  openembedded-core
+  URI: https://github.com/openembedded/openembedded-core
+  branch: master
+
+  meta-openembedded/meta-oe
+  URI: https://github.com/openembedded/meta-openembedded
+  branch: master
+
+Patches
+=======
+
+Please submit any patches against the meta-kcrash layer as a github pull request, or send email to maintainer.
+
+Maintainer: Alexander Kamensky <alexander.kamensky42@gmail.com>
+
+Table of Contents
+=================
+
+  I. Adding the meta-kcrash layer to your build
+ II. Build
+III. Invocation
+ IV. Kdump supported formats
+  V. Upstream projects URIs
+
+I. Adding the meta-kcrash layer to your build
+=================================================
+
+Run 'bitbake-layers add-layer meta-kcrash'
+
+II. Build
+=========
+To get crash-python installed as linux-yocto recipe-sysroot-native add the following line to conf/local.conf
+
+DEPENDS_append_pn-linux-yocto = " crash-python-native gdb-cross-x86_64"
+
+Make sure that you enable kernel debug symbols in the build by add the following line to conf/local.conf
+
+KERNEL_EXTRA_FEATURES_append = " features/debug/debug-kernel.scc"
+
+
+III. Invocation
+===============
+After build of linux-yocto find the crash-python in
+
+$BUILDDIR/tmp-glibc/work/qemux86_64-oe-linux/linux-yocto/*/recipe-sysroot-native/usr/bin/pycrash
+
+Invoke pycrash as
+
+pycrash vmlinux vmcore
+
+For example
+
+$BUILDDIR/tmp-glibc/work/qemux86_64-oe-linux/linux-yocto/*/recipe-sysroot-native/usr/bin/pycrash \
+   tmp-glibc/work/qemux86_64-oe-linux/linux-yocto/5.8.13+gitAUTOINC+34775c20bc_5981001bf0-r0/linux-*-build/vmlinux \
+   ~/vmcore
+
+
+IV. Kdump supported formats
+===========================
+If you want crash-python to understand lzo and/or snappy compressed dump files enable "lzo" and/or "snappy" package features for example
+by adding the following line to conf/local.conf
+
+PACKAGECONFIG_append_pn-libkdumpfile-native = " lzo snappy"
+
+V. Upstream Projects URIs
+=========================
+All great functionality of crash-python comes from the following upstream projects, meta-kcrash layer merely assembles them in open embedded format.
+
+  crash-python:  https://github.com/crash-python/crash-python
+
+  libkdumpfile:  https://github.com/ptesarik/libkdumpfile
+
+  gdb-python:    https://github.com/crash-python/gdb-python
