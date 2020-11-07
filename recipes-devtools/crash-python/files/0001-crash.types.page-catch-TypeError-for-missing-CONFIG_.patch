@@ -1,0 +1,33 @@
+From 23eca00b04361cc5a1ca24306fcc056d9c7bc0c3 Mon Sep 17 00:00:00 2001
+From: Alexander Kamensky <alexander.kamensky42@gmail.com>
+Date: Mon, 2 Nov 2020 11:54:49 -0800
+Subject: [PATCH 1/4] crash.types.page: catch TypeError for missing
+ CONFIG_NODES_SHIFT
+
+On system without CONFIG_NODES_SHIFT in config referncing config["NODE_SHIFT"]
+returns a NoneType instead of a KeyError, this results in a TypeError execption
+when NoneType is converted to integer.
+
+Catch TypeError exception to fall back to hard coded value
+
+Signed-off-by: Alexander Kamensky <alexander.kamensky42@gmail.com>
+---
+ crash/types/page.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crash/types/page.py b/crash/types/page.py
+index 744a4e5..687113c 100644
+--- a/crash/types/page.py
++++ b/crash/types/page.py
+@@ -141,7 +141,7 @@ class Page:
+         # TODO: handle kernels with no space for nodes in page flags
+         try:
+             cls.NODES_WIDTH = int(config['NODES_SHIFT'])
+-        except (KeyError, DelayedAttributeError):
++        except (KeyError, TypeError, DelayedAttributeError):
+             # XXX
+             print("Unable to determine NODES_SHIFT from config, trying 8")
+             cls.NODES_WIDTH = 8
+-- 
+2.26.2
+

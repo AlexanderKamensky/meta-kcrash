@@ -1,0 +1,57 @@
+From 4b6fe7a0a614ce0227719f6a780da088c6a47f96 Mon Sep 17 00:00:00 2001
+From: Alexander Kamensky <alexander.kamensky42@gmail.com>
+Date: Mon, 2 Nov 2020 16:13:01 -0800
+Subject: [PATCH 2/4] crash.sh: adapted to oe environment
+
+- call gdb relative to our location
+- use share directory relative to our location
+- call gdb python from the same directory as crash.sh because our gdb version
+contains required gdb patches
+
+Signed-off-by: Alexander Kamensky <alexander.kamensky42@gmail.com>
+---
+ crash.sh | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/crash.sh b/crash.sh
+index 1c18fa3..5fbfe1d 100755
+--- a/crash.sh
++++ b/crash.sh
+@@ -149,8 +149,13 @@ GDBINIT="$TMPDIR/gdbinit"
+ 
+ set -e
+ 
++# From where we started
++DIR="$(dirname $0)"
++# Make it absolute path name
++DIR="$(cd $DIR; pwd)"
++
+ GDB=
+-for gdb in crash-python-gdb gdb; do
++for gdb in crash-python-gdb $DIR/*/*-gdb gdb; do
+     if $gdb -v > /dev/null 2> /dev/null; then
+         GDB=$gdb
+         break
+@@ -163,7 +168,6 @@ if [ -z "$GDB" ]; then
+ fi
+ 
+ # If we're using crash.sh from the git repo, use the modules from the git repo
+-DIR="$(dirname $0)"
+ if [ -e "$DIR/setup.py" ]; then
+     pushd $DIR > /dev/null
+     rm -rf build/lib/crash
+@@ -181,9 +185,9 @@ if [ -e "$DIR/setup.py" ]; then
+         fi
+     done
+ else
+-    export CRASH_PYTHON_HELP="/usr/share/crash-python/help"
++    export CRASH_PYTHON_HELP="$DIR/../share/crash-python/help"
+     :> $GDBINIT
+-    TEST_GDBINIT="/usr/share/crash-python/test-gdb-compatibility.gdbinit"
++    TEST_GDBINIT="$DIR/../share/crash-python/test-gdb-compatibility.gdbinit"
+ fi
+ 
+ if ! $GDB -nx -batch -x $GDBINIT -x $TEST_GDBINIT; then
+-- 
+2.26.2
+

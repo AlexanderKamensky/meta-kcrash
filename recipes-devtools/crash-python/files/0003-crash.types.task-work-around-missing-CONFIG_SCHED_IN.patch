@@ -1,0 +1,65 @@
+From ee508e3a2514787c5716c6cc0510acbc053a7420 Mon Sep 17 00:00:00 2001
+From: Alexander Kamensky <alexander.kamensky42@gmail.com>
+Date: Tue, 3 Nov 2020 12:08:38 -0800
+Subject: [PATCH 3/4] crash.types.task: work around missing CONFIG_SCHED_INFO
+
+In Yocto Project 5.8 kernel pycrash produces the following exception:
+
+Loading tasks...crash-python: Failed to open /home/skamensk/oe/20201017/build/vmcore.  No method to retrieve last run from task found.
+Traceback (most recent call last):
+  File "<string>", line 38, in <module>
+  File "./build/lib/crash/session.py", line 33, in __init__
+    self.kernel.setup_tasks()
+  File "./build/lib/crash/kernel.py", line 691, in setup_tasks
+    ltask = LinuxTask(task)
+  File "./build/lib/crash/types/task.py", line 229, in __init__
+    self._init_task_types(task_struct)
+  File "./build/lib/crash/types/task.py", line 269, in _init_task_types
+    cls._pick_last_run()
+  File "./build/lib/crash/types/task.py", line 604, in _pick_last_run
+    raise RuntimeError("No method to retrieve last run from task found.")
+RuntimeError: No method to retrieve last run from task found.
+
+It turns out that Yocto Project 5.8 kernel does not enable CONFIG_TASKSTATS
+and CONFIG_TASK_DELAY_ACCT as result CONFIG_SCHED_INFO is not selected,
+as a result this raises the aformentioned exception because struct sched_info
+does not have any fields in this case. To work around this
+the raising of the RuntimeError was replaced with a print out that states
+which CONFIGS must be enabled and cls._get_last was set to a function that
+will always return 0.
+
+'pyps -l' functionality is important but there are plenty of other useful
+funcationality even if we cannot figure out last run time of task.
+
+Signed-off-by: Alexander Kamensky <alexander.kamensky42@gmail.com>
+---
+ crash/types/task.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/crash/types/task.py b/crash/types/task.py
+index 77ff6b4..90b5970 100644
+--- a/crash/types/task.py
++++ b/crash/types/task.py
+@@ -588,6 +588,9 @@ class LinuxTask:
+     def _last_run__last_arrival(self) -> int:
+         return int(self.task_struct['sched_info']['last_arrival'])
+ 
++    def _last_run__return_zero(self) -> int:
++        return 0
++
+     @classmethod
+     def _pick_last_run(cls) -> None:
+         fields = types.task_struct_type.keys()
+@@ -601,7 +604,8 @@ class LinuxTask:
+         elif 'timestamp' in fields:
+             cls._get_last_run = cls._last_run__timestamp
+         else:
+-            raise RuntimeError("No method to retrieve last run from task found.")
++            cls._get_last_run = cls._last_run__return_zero
++            print("No method to retrieve last run from task found. Consider enabling CONFIG_TASKSTATS and CONFIG_TASK_DELAY_ACCT to activate CONFIG_SCHED_INFO kernel config")
+ 
+     def last_run(self) -> int:
+         """
+-- 
+2.26.2
+

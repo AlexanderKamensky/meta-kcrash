@@ -1,0 +1,76 @@
+From b2281277c6c11ce28576aa7a311391e2936ce62e Mon Sep 17 00:00:00 2001
+From: Alexander Kamensky <alexander.kamensky42@gmail.com>
+Date: Tue, 3 Nov 2020 16:38:24 -0800
+Subject: [PATCH 4/4] crash.commands.kmem: keep working even if system uses
+ CONFIG_SLUB
+
+In Yocto 5.8 kernel it was observed that pycrash produces the following
+exception:
+
+...
+  File "/home/skamensk/crash-python/20201101/crash-python/build/lib/crash/commands/kmem.py", line 28, in <module>
+    from crash.types.slab import kmem_cache_get_all, kmem_cache_from_name
+...
+  File "/home/skamensk/crash-python/20201101/crash-python/build/lib/crash/types/slab.py", line 328, in check_kmem_cache_type
+    cls.percpu_name = find_member_variant(gdbtype, ['cpu_cache', 'array'])
+  File "/home/skamensk/crash-python/20201101/crash-python/build/lib/crash/util/__init__.py", line 304, in find_member_variant
+    raise TypeError("Unrecognized '{}': could not find member '{}'"
+TypeError: Unrecognized 'struct kmem_cache': could not find member 'cpu_cache'
+
+Yocto Project 5.8 Kernel configured with CONFIG_SLUB. In this case struct
+kem_cache does not have field cpu_cache, so lookup of this field fails in
+such configuration.
+
+Workaround is to check kernel config if CONFIG_SLUB is enabled and skip slab
+specif functionality if that is the case.
+
+TODO: Implement slub analogs for slab operations.
+
+Signed-off-by: Alexander Kamensky <alexander.kamensky42@gmail.com>
+---
+ crash/commands/kmem.py | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/crash/commands/kmem.py b/crash/commands/kmem.py
+index f098954..8facc49 100644
+--- a/crash/commands/kmem.py
++++ b/crash/commands/kmem.py
+@@ -25,12 +25,21 @@ import argparse
+ 
+ from crash.commands import Command, ArgumentParser
+ from crash.commands import CommandError, CommandLineError
+-from crash.types.slab import kmem_cache_get_all, kmem_cache_from_name
+-from crash.types.slab import slab_from_obj_addr, KmemCacheNotFound
+ from crash.types.node import for_each_zone, for_each_populated_zone
+ from crash.types.vmstat import VmStat
+ from crash.util import get_symbol_value
+ from crash.exceptions import MissingSymbolError
++from crash.cache.syscache import config
++
++if config["SLUB"]:
++    slub_kernel = True
++else:
++    slub_kernel = False
++    try:
++        from crash.types.slab import kmem_cache_get_all, kmem_cache_from_name
++        from crash.types.slab import slab_from_obj_addr, KmemCacheNotFound
++    except TypeError:
++        slub_kernel = True
+ 
+ class KmemCommand(Command):
+     """ kernel memory inspection"""
+@@ -56,6 +65,11 @@ class KmemCommand(Command):
+             self.print_vmstats()
+             return
+ 
++        if slub_kernel:
++            # not supported for now
++            print("-s and address options not supported on non-SLAB systems")
++            return
++
+         if args.slabname:
+             if args.slabname is True:
+                 print("Checking all kmem caches...")
+-- 
+2.26.2
+
