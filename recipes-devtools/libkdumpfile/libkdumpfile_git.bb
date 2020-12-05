@@ -16,7 +16,10 @@ SRCREV = "fedbe7f66561754782165be2512bca0ed1b775e9"
 
 PV = "v0.4.0+git${SRCPV}"
 
-SRC_URI = "git://github.com/ptesarik/libkdumpfile;branch=${SRCBRANCH}"
+SRC_URI = "git://github.com/ptesarik/libkdumpfile;branch=${SRCBRANCH} \
+           file://0001-added-way-to-read-NUMBER-values-from-vmcoreinfo.patch \
+           file://0002-addrxlat-aarch64-add-linux-vmcore-support-for-kernel.patch \
+          "
 
 S = "${WORKDIR}/git"
 

@@ -1,0 +1,95 @@
+From ef58fba3c673876f5afe1f412276d7e70dbc44fc Mon Sep 17 00:00:00 2001
+From: Alexander Kamensky <alexander.kamensky42@gmail.com>
+Date: Thu, 3 Dec 2020 17:47:20 -0800
+Subject: [PATCH 1/2] crash.arch.aarch64: added support for aarch64
+ architecture
+
+Created new archiceture module aarch64.py. Scheduled task registers
+are retrieved from thread_info.cpu_context.
+
+Signed-off-by: Alexander Kamensky <alexander.kamensky42@gmail.com>
+---
+ crash/arch/aarch64.py | 58 +++++++++++++++++++++++++++++++++++++++++++
+ crash/kernel.py       |  1 +
+ 2 files changed, 59 insertions(+)
+ create mode 100644 crash/arch/aarch64.py
+
+diff --git a/crash/arch/aarch64.py b/crash/arch/aarch64.py
+new file mode 100644
+index 0000000..adcce6f
+--- /dev/null
++++ b/crash/arch/aarch64.py
+@@ -0,0 +1,58 @@
++# -*- coding: utf-8 -*-
++# vim:set shiftwidth=4 softtabstop=4 expandtab textwidth=79:
++
++from crash.arch import CrashArchitecture, KernelFrameFilter, register_arch
++from crash.arch import FetchRegistersCallback
++
++import gdb
++
++class _FRC_inactive_task_frame(FetchRegistersCallback): # pylint: disable=abstract-method
++    def fetch_active(self, thread: gdb.InferiorThread, register: int) -> None:
++        task = thread.info
++        for reg in task.regs:
++            try:
++                thread.registers[reg].value = task.regs[reg]
++            except KeyError:
++                pass
++
++    def fetch_scheduled(self, thread: gdb.InferiorThread,
++                        register: int) -> None:
++        task = thread.info.task_struct
++
++
++        thread.registers['x19'].value = task['thread']['cpu_context']['x19']
++        thread.registers['x20'].value = task['thread']['cpu_context']['x20']
++        thread.registers['x21'].value = task['thread']['cpu_context']['x21']
++        thread.registers['x22'].value = task['thread']['cpu_context']['x22']
++        thread.registers['x23'].value = task['thread']['cpu_context']['x23']
++        thread.registers['x24'].value = task['thread']['cpu_context']['x24']
++        thread.registers['x25'].value = task['thread']['cpu_context']['x25']
++        thread.registers['x26'].value = task['thread']['cpu_context']['x26']
++        thread.registers['x27'].value = task['thread']['cpu_context']['x27']
++        thread.registers['x28'].value = task['thread']['cpu_context']['x28']
++        thread.registers['x29'].value = task['thread']['cpu_context']['fp']
++
++        thread.registers['sp'].value = task['thread']['cpu_context']['sp']
++        thread.registers['pc'].value = task['thread']['cpu_context']['pc']
++
++        thread.info.stack_pointer = task['thread']['cpu_context']['sp']
++        thread.info.valid_stack = True
++
++class Aarch64Architecture(CrashArchitecture):
++    ident = "aarch64"
++    aliases = ["elf64-aarch64"]
++
++    _fetch_registers = _FRC_inactive_task_frame
++
++    def __init__(self) -> None:
++        super(Aarch64Architecture, self).__init__()
++
++    def setup_thread_info(self, thread: gdb.InferiorThread) -> None:
++        task = thread.info.task_struct
++        thread.info.set_thread_info(task['thread_info'].address)
++
++    @classmethod
++    def get_stack_pointer(cls, thread_struct: gdb.Value) -> int:
++        return int(thread_struct['cpu_context']['sp'])
++
++register_arch(Aarch64Architecture)
+diff --git a/crash/kernel.py b/crash/kernel.py
+index d48d797..f8152a2 100644
+--- a/crash/kernel.py
++++ b/crash/kernel.py
+@@ -14,6 +14,7 @@ import crash
+ import crash.arch
+ import crash.arch.x86_64
+ import crash.arch.ppc64
++import crash.arch.aarch64
+ from crash.types.module import for_each_module, for_each_module_section
+ from crash.util import get_symbol_value
+ from crash.util.symbols import Types, Symvals, Symbols
+-- 
+2.26.2
+

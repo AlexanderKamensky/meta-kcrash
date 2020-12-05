@@ -18,6 +18,8 @@ SRC_URI = "git://github.com/crash-python/crash-python;branch=${SRCBRANCH} \
            file://0002-crash.sh-adapted-to-oe-environment.patch \
            file://0003-crash.types.task-work-around-missing-CONFIG_SCHED_IN.patch \
            file://0004-crash.commands.kmem-keep-working-even-if-system-uses.patch \
+           file://0001-crash.arch.aarch64-added-support-for-aarch64-archite.patch \
+           file://0002-crash.types.percpu-aarch64-does-not-need-pre-cpu-sym.patch \
 "
 
 S = "${WORKDIR}/git"

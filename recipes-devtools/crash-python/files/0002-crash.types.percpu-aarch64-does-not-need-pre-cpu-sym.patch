@@ -1,0 +1,34 @@
+From 523ddf8d7f5f0fedabc5d75fd2d6e275aa6634a1 Mon Sep 17 00:00:00 2001
+From: Alexander Kamensky <alexander.kamensky42@gmail.com>
+Date: Thu, 3 Dec 2020 17:48:01 -0800
+Subject: [PATCH 2/2] crash.types.percpu: aarch64 does not need pre cpu symbols
+ relocation
+
+On aarch64 all .data..percpu is properly rellocated in gdb so using
+'__per_cpu_offset[cpuindx] + gdbsymval' should be fine. Added a check in
+_relocated_offset if arch is aarch64 it will merely return int(var)
+
+Signed-off-by: Alexander Kamensky <alexander.kamensky42@gmail.com>
+---
+ crash/types/percpu.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/crash/types/percpu.py b/crash/types/percpu.py
+index 1f8d6e8..224d449 100644
+--- a/crash/types/percpu.py
++++ b/crash/types/percpu.py
+@@ -225,6 +225,11 @@ class PerCPUState:
+     # the previous section.  It's possible to override this while
+     # loading debuginfo but not when debuginfo is embedded.
+     def _relocated_offset(self, var: gdb.Value) -> int:
++        # on aarch64 all .data..percpu are properly rellocated in gdb
++        # so '__per_cpu_offset[cpu] + symbol' works just fine
++        if gdb.inferiors()[0].architecture().name() == "aarch64":
++            return int(var)
++
+         addr = int(var)
+         start = msymvals['__per_cpu_start']
+         size = self._static_ranges[start]
+-- 
+2.26.2
+

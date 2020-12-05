@@ -1,0 +1,138 @@
+From 75e914fead3f4436d98115c33acc963e1caee397 Mon Sep 17 00:00:00 2001
+From: Alexander Kamensky <alexander.kamensky42@gmail.com>
+Date: Thu, 3 Dec 2020 18:13:06 -0800
+Subject: [PATCH 1/2] added way to read NUMBER values from vmcoreinfo
+
+Aarch64 vmcore reports VA_BITS, kimage_voffset, PHYS_OFFSET as NUMBERs.
+We need those values in order to calculate aarch64 kernel pgt, levels, and
+memory layout.
+
+Previously ctx had no way of reading NUMBER fields from vmcoreinfo.
+Added functions and map to read NUMBER fields. It is pretty much
+the same as reading SYMBOL, OFFSETOF, SIZEOF etc.
+
+Signed-off-by: Alexander Kamensky <alexander.kamensky42@gmail.com>
+---
+ include/libkdumpfile/addrxlat.h.in |  9 +++++++++
+ src/addrxlat/addrxlat-priv.h       |  3 +++
+ src/addrxlat/ctx.c                 | 30 ++++++++++++++++++++++++++++++
+ src/kdumpfile/vtop.c               | 14 ++++++++++++++
+ 4 files changed, 56 insertions(+)
+
+diff --git a/include/libkdumpfile/addrxlat.h.in b/include/libkdumpfile/addrxlat.h.in
+index c39c48d..38fc579 100644
+--- a/include/libkdumpfile/addrxlat.h.in
++++ b/include/libkdumpfile/addrxlat.h.in
+@@ -263,6 +263,14 @@ typedef enum _addrxlat_sym_type {
+ 	 * - @c val = @c offsetof(args[0],args[1])
+ 	 */
+ 	ADDRXLAT_SYM_OFFSETOF,
++
++	/** Number value.
++	 * Input:
++	 * - @c args[0] = number name
++	 * Output:
++	 * - @c val = number value
++	 */
++	ADDRXLAT_SYM_NUMBER,
+ } addrxlat_sym_type_t;
+ 
+ /** Maximum argument count for @ref addrxlat_sym_t. */
+@@ -281,6 +289,7 @@ addrxlat_sym_argc(addrxlat_sym_type_t type)
+ 	case ADDRXLAT_SYM_REG:
+ 	case ADDRXLAT_SYM_VALUE:
+ 	case ADDRXLAT_SYM_SIZEOF:
++	case ADDRXLAT_SYM_NUMBER:
+ 		return 1;
+ 
+ 	case ADDRXLAT_SYM_OFFSETOF:
+diff --git a/src/addrxlat/addrxlat-priv.h b/src/addrxlat/addrxlat-priv.h
+index 333b163..fee6389 100644
+--- a/src/addrxlat/addrxlat-priv.h
++++ b/src/addrxlat/addrxlat-priv.h
+@@ -178,6 +178,9 @@ INTERNAL_DECL(addrxlat_status, get_offsetof,
+ 	      (addrxlat_ctx_t *ctx, const char *type, const char *memb,
+ 	       addrxlat_addr_t *off));
+ 
++INTERNAL_DECL(addrxlat_status, get_number,
++	      (addrxlat_ctx_t *ctx, const char *name, addrxlat_addr_t *num));
++
+ /** Maximum symbol specifier name length. */
+ #define SYM_SPEC_NAMELEN 24
+ 
+diff --git a/src/addrxlat/ctx.c b/src/addrxlat/ctx.c
+index a5a479d..38b7317 100644
+--- a/src/addrxlat/ctx.c
++++ b/src/addrxlat/ctx.c
+@@ -546,6 +546,36 @@ get_offsetof(addrxlat_ctx_t *ctx, const char *type, const char *memb,
+ 	return status;
+ }
+ 
++/** Resolve a number value.
++ * @param      ctx   Address translation context.
++ * @param      name  Number name.
++ * @param[out] num   Number value returned on success.
++ * @returns	     Error status.
++ *
++ * The size is determined using a user-supplied callback.
++ */
++addrxlat_status
++get_number(addrxlat_ctx_t *ctx, const char *name, addrxlat_addr_t *num)
++{
++	addrxlat_sym_t sym;
++	addrxlat_status status;
++
++	if (!ctx->cb.sym)
++		return set_error(ctx, ADDRXLAT_ERR_NODATA,
++				 "No symbolic information callback");
++
++	sym.type = ADDRXLAT_SYM_NUMBER;
++	sym.args[0] = name;
++	status = ctx->cb.sym(ctx->cb.data, &sym);
++	if (status != ADDRXLAT_OK)
++		return set_error(ctx, status, "Cannot get number(%s)",
++				 sym.args[0]);
++
++	*num = sym.val;
++	return status;
++}
++
++
+ /** Get the first successfuly resolved value from a specifier list.
+  * @param      ctx   Address translation context.
+  * @param      spec  Vector of specifiers.
+diff --git a/src/kdumpfile/vtop.c b/src/kdumpfile/vtop.c
+index 3b5dc0d..941b86e 100644
+--- a/src/kdumpfile/vtop.c
++++ b/src/kdumpfile/vtop.c
+@@ -578,6 +578,12 @@ addrxlat_sym(void *data, addrxlat_sym_t *sym)
+ 		{ ADDRXLAT_OS_UNKNOWN }
+ 	};
+ 
++	static const struct ostype_attr_map number_map[] = {
++		{ ADDRXLAT_OS_LINUX, GKI_linux_number },
++		{ ADDRXLAT_OS_XEN, GKI_xen_number },
++		{ ADDRXLAT_OS_UNKNOWN }
++	};
++
+ 	kdump_ctx_t *ctx = (kdump_ctx_t*) data;
+ 	const struct attr_data *base;
+ 	struct attr_data *attr;
+@@ -608,6 +614,14 @@ addrxlat_sym(void *data, addrxlat_sym_t *sym)
+ 				"Unsupported OS");
+ 		break;
+ 
++        case ADDRXLAT_SYM_NUMBER:
++		base = ostype_attr(ctx, number_map);
++		if (!base)
++			return addrxlat_ctx_err(
++				ctx->xlatctx, ADDRXLAT_ERR_NOTIMPL,
++				"Unsupported OS");
++		break;
++
+ 	case ADDRXLAT_SYM_REG:
+ 		rwlock_rdlock(&ctx->shared->lock);
+ 		base = lookup_attr(ctx->dict, "cpu.0.reg");
+-- 
+2.26.2
+
