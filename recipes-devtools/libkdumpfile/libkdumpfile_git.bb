@@ -12,13 +12,11 @@ LIC_FILES_CHKSUM = "file://COPYING;md5=4ca7e035a55f25a55e4a1fde7c9d621c \
                     file://COPYING.LGPLv3;md5=e6a600fd5e1d9cbde2d983680233ad02"
 
 SRCBRANCH ?= "tip"
-SRCREV = "fedbe7f66561754782165be2512bca0ed1b775e9"
+SRCREV = "7ec08b983f6a27f94653b3ce8ea30c0563ade2d5"
 
 PV = "v0.4.0+git${SRCPV}"
 
 SRC_URI = "git://github.com/ptesarik/libkdumpfile;branch=${SRCBRANCH} \
-           file://0001-added-way-to-read-NUMBER-values-from-vmcoreinfo.patch \
-           file://0002-addrxlat-aarch64-add-linux-vmcore-support-for-kernel.patch \
           "
 
 S = "${WORKDIR}/git"
