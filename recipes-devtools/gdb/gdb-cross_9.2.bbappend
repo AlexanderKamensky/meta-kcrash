@@ -1,2 +1,0 @@
-require gdb-python.inc
-
