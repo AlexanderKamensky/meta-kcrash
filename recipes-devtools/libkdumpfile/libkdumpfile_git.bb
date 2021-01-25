@@ -17,6 +17,7 @@ SRCREV = "7ec08b983f6a27f94653b3ce8ea30c0563ade2d5"
 PV = "v0.4.0+git${SRCPV}"
 
 SRC_URI = "git://github.com/ptesarik/libkdumpfile;branch=${SRCBRANCH} \
+          file://0001-kdump-gdbserver-adds-kdump-gdbserver-utility.patch \
           "
 
 S = "${WORKDIR}/git"
@@ -29,14 +30,28 @@ PACKAGECONFIG ??= ""
 PACKAGECONFIG[lzo] = "--with-lzo,--without-lzo,lzo"
 PACKAGECONFIG[snappy] = "--with-snappy,--without-snappy,snappy"
 
-# remove examples binaries
+# install kdump-gdbserver manuelly since it doesn't have automake logic yet
 do_install_append () {
-        rm -rf "${D}${bindir}"
+        install -m 755 ${S}/gdbserver/kdump-gdbserver ${D}${bindir}
+        install -d ${D}${datadir}/libkdumpfile/gdbserver
+        install -m 644 ${S}/gdbserver/README.md ${D}${datadir}/libkdumpfile/gdbserver
+        install -m 644 ${S}/gdbserver/KdumpGdbCommands.py ${D}${datadir}/libkdumpfile/gdbserver
+        #sed -e s,/usr/bin/env\ ,${bindir}/, -i ${D}${bindir}/kdump-gdbserver
 }
 
-PACKAGES += "python3-libkdumpfile"
+# remove rpath from cpython .so since libkdumpfile libraries are at standard location
+do_install_append_class-nativesdk () {
+        chrpath --delete ${D}${libdir}/${PYTHON_DIR}/site-packages/*.so || true
+}
+
+PACKAGES_prepend += "python3-libkdumpfile ${PN}-gdbserver "
 FILES_python3-libkdumpfile += "${PYTHON_SITEPACKAGES_DIR}"
+FILES_${PN}-gdbserver += "\
+                ${bindir}/kdump-gdbserver \
+                ${datadir}/libkdumpfile/gdbserver \
+"
+RDEPENDS_${PN}-gdbserver = "python3-libkdumpfile"
 
 COMPATIBLE_HOST = '(x86_64.*|aarch64.*)'
 
-BBCLASSEXTEND = "native"
+BBCLASSEXTEND = "native nativesdk"

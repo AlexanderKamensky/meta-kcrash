@@ -1,0 +1,1327 @@
+From c3ff0abdf7fa9beb532d4871caf17e2b79e5fdb0 Mon Sep 17 00:00:00 2001
+From: Alexander Kamensky <alexander.kamensky42@gmail.com>
+Date: Mon, 18 Jan 2021 14:57:18 -0800
+Subject: [PATCH] kdump-gdbserver: adds kdump-gdbserver utility
+
+Kdump-gdbserver reads kernel dump file (vmcore) and uses gdb remote protocol to
+interface with gdb. In gdb use 'target remote' command to connect to port on
+which kdump-gdbserver is listening. As result it allows symbolic inspection of
+the kdump file. Kdump-gdbserver uses libkdumpfile library to read vmcore file,
+translate memory read requests using va to pa translation, and fetch registers
+values from PRSTATUS note as kdump object attributes.
+
+kdump-gdbserver server can operate in one of the three following modes:
+
+1. kernel - primary mode, gdb can read kernel memory translated through the
+kernel page table, and each cpu core is presented as a separate thread
+
+2. kernel with tasks - same as kernel mode but also all kernel tasks will be
+presented as threads. To operate in this mode kdump-gdbserver needs
+information about all kernel tasks registers which is passed in an additional
+json file that should be generated in kernel mode.
+
+3. process mode - if vmcore contains user-land processes pages kdump-gdbserver
+can present this process address space and its threads. It would present the
+same view to gdb as one can get from regular user-land process core. And it
+could be done for any user-land process present in kernel crash moment. Similar
+to kernel with tasks mode this mode also requires a json file with additional
+information that can be generated in kernel mode.
+
+Also patch includes KdumpGdbCommands.py script a set of gdb python commands that
+are used in conjunction with kdump-gdbserver. Namely to create json files
+necessary for modes 2 and 3.
+
+Please see README.md file, which is part of this commit, for more details.
+
+Upstream-Status: Submitted [https://github.com/ptesarik/libkdumpfile/pull/35]
+
+Signed-off-by: Alexander Kamensky <alexander.kamensky42@gmail.com>
+---
+ gdbserver/KdumpGdbCommands.py | 303 +++++++++++++++++
+ gdbserver/README.md           | 337 ++++++++++++++++++
+ gdbserver/kdump-gdbserver     | 619 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 1259 insertions(+)
+ create mode 100644 gdbserver/KdumpGdbCommands.py
+ create mode 100644 gdbserver/README.md
+ create mode 100755 gdbserver/kdump-gdbserver
+
+diff --git a/gdbserver/KdumpGdbCommands.py b/gdbserver/KdumpGdbCommands.py
+new file mode 100644
+index 0000000..b93c268
+--- /dev/null
++++ b/gdbserver/KdumpGdbCommands.py
+@@ -0,0 +1,303 @@
++import json
++import os
++
++
++# We don't want to polute gdb python namespace with our helper function so
++# put them into separate class as staticmethods
++class KdumpGdbserverBase:
++    """
++    Collection of static methods used by multiple commands,
++    compiled into a class to avoid polluting gdb's python
++    name space
++    """
++
++    @staticmethod
++    def offsetof(parent, field):
++        """find offset of field within given parent structure"""
++        return gdb.parse_and_eval("(unsigned int) (&((({} *) 0)->{}))".format(parent, field))
++
++    @staticmethod
++    def container_of(ptr, ctype, member):
++        """retrieve structure address with pointer to given field"""
++        void_ptr_type = gdb.lookup_type("void").pointer()
++        return (ptr.cast(void_ptr_type) - KdumpGdbserverBase.offsetof(ctype, member)).cast(ctype.pointer())
++
++    @staticmethod
++    def kernellist(start, field, stype, include_first=False):
++        """generator to walk kernel list"""
++        if start.type.code != gdb.TYPE_CODE_PTR:
++            start = start.address
++
++        current = start
++        if include_first:
++            yield KdumpGdbserverBase.container_of(current, stype, field)
++
++        current = current["next"]
++        while current != start:
++            yield KdumpGdbserverBase.container_of(current, stype, field)
++            current = current["next"]
++
++    @staticmethod
++    def get_thread_info(task, pid, regs, threads):
++        """return basic thread info as dictionary"""
++        comm = task["comm"].string()
++        if int(task['mm']) == 0:
++            comm = "[" + comm + "]"
++        tid = int(task["pid"])
++
++        thread = {
++            "pid": pid,
++            "tid": tid,
++            "comm": comm,
++            "registers": regs}
++        threads.append(thread)
++        return threads
++
++
++class KdumpGdbserverKernelPs(gdb.Command):
++    """list all tasks in current kernel
++
++Command outputs information on all processes similar to "ps -efL" command
++    """
++
++    def __init__(self):
++        super(KdumpGdbserverKernelPs, self).__init__("kdump-kernel-ps", gdb.COMMAND_USER)
++
++    @staticmethod
++    def print_ps(gvalue, pid):
++        """print process information in "ps -efL" kind of format, plus task_struct ptr"""
++        uid = int(gvalue['real_cred']['uid']['val'])
++        ppid = int(gvalue['parent']['pid'])
++        lwp = int(gvalue['pid'])
++
++        comm = gvalue['comm'].string()
++        if int(gvalue['mm']) == 0:
++            comm = "[" + comm + "]"
++
++        address = str(gvalue).split()[0]
++
++        print('{:<10d} {:<10d} {:<10d} {:<10d} {:<25s} {:<16s}'.format(uid, pid, ppid, lwp, comm, address))
++
++    def invoke(self, arg, from_tty):
++        init_task = gdb.parse_and_eval("init_task")
++        print('{:<10s} {:<10s} {:<10s} {:<10s} {:<25s} {:<16s}'.format("UID", "PID", "PPID", "LWP", "COMM", "ADDRESS"))
++        for task in KdumpGdbserverBase.kernellist(init_task["tasks"], "tasks", init_task.type, include_first=True):
++            pid = int(task["pid"])
++            KdumpGdbserverKernelPs.print_ps(task, pid)
++            # needs to walk all threads for this pid if any
++            for ctask in KdumpGdbserverBase.kernellist(task["thread_group"], "thread_group", init_task.type):
++                KdumpGdbserverKernelPs.print_ps(ctask, pid)
++
++
++class KdumpGdbserverMakeProcessJson(gdb.Command):
++    """generates kdump-gdbserver process json file
++
++This command given a process id and file name will
++generate a json file containing information necessary for
++kdump-gdbserver to run in process mode
++
++usage: kdump-save-process-json <filename> <pid>"""
++
++    def __init__(self):
++        super(KdumpGdbserverMakeProcessJson, self).__init__("kdump-save-process-json",
++                                                            gdb.COMMAND_USER,
++                                                            gdb.COMPLETE_FILENAME)
++        self.ARCH_USR_REGS_FUNC = {
++            "aarch64": KdumpGdbserverMakeProcessJson.get_thread_regs_aarch64,
++            "i386:x86-64": KdumpGdbserverMakeProcessJson.get_thread_regs_x86_64,
++        }
++
++    @staticmethod
++    def get_first_exec_addr(task):
++        """Find first executable section of memory to find process start"""
++        current_mm = task['mm']['mmap']
++
++        while current_mm != 0:
++            flags = int(current_mm['vm_flags'])
++            if flags & 4:
++                return current_mm['vm_start']
++            current_mm = current_mm['vm_next']
++
++    @staticmethod
++    def findtask(pid):
++        """Locate task struct of process with given pid"""
++        tpid = int(pid)
++        init_task = gdb.parse_and_eval("init_task")
++        for task in KdumpGdbserverBase.kernellist(init_task["tasks"], "tasks", init_task.type, include_first=True):
++            if int(task['pid']) == tpid:
++                return task
++            for ctask in KdumpGdbserverBase.kernellist(task["thread_group"], "thread_group", init_task.type):
++                if int(ctask['pid']) == tpid:
++                    # note returns leading task, not the one that matches requested pid
++                    return task
++
++    @staticmethod
++    def get_thread_regs_aarch64(task):
++        """read user-land registers for aarch64 architecture"""
++
++        # find pointer to struct pt_regs on current task stack. It is pretty
++        # much implementation of task_pt_regs macro from arch/arm64/include/asm/processor.h
++        # #define task_pt_regs(p) \
++        #    ((struct pt_regs *)(THREAD_SIZE + task_stack_page(p)) - 1)
++        # Note values we use may not work for kernel built with CONFIG_KASAN
++        # TODO: look at kasan case
++        eval_string = "((struct pt_regs *)(0x4000 + (void *) (((struct task_struct *)0x%x)->stack)) - 1)" % (task)
++        pt_regs = gdb.parse_and_eval(eval_string)
++
++        regs = {}
++        for x in range(31):
++            regs["x%d" % (x)] = int(pt_regs["user_regs"]["regs"][x])
++        regs["sp"] = int(pt_regs["user_regs"]["sp"])
++        regs["pc"] = int(pt_regs["user_regs"]["pc"])
++        regs["cpsr"] = int(pt_regs["user_regs"]["pstate"])
++        return regs
++
++    @staticmethod
++    def get_thread_regs_x86_64(task):
++        """read user-land registers for x86_64 architecture"""
++
++        # find pointer to struct pt_regs on current task stack. It is pretty
++        # much implementation of task_pt_regs macro from arch/x86/include/asm/processor.h
++        # #define task_pt_regs(task)
++        # ({									\
++        #	unsigned long __ptr = (unsigned long)task_stack_page(task);	\
++        #	__ptr += THREAD_SIZE - TOP_OF_KERNEL_STACK_PADDING;		\
++        #	((struct pt_regs *)__ptr) - 1;					\
++        # })
++        # Note values we use may not work for kernel built with CONFIG_KASAN
++        # TODO: look at kasan case
++        eval_string = "((struct pt_regs *)(0x4000 + (void *) (((struct task_struct *)0x%x)->stack)) - 1)" % (task)
++        pt_regs = gdb.parse_and_eval(eval_string)
++
++        regs = {}
++        for x in range(8, 16):
++            regs["r%d" % (x)] = int(pt_regs["r%d" % (x)])
++        regs["eflags"] = int(pt_regs["flags"])
++        regs["cs"] = int(pt_regs["cs"])
++        regs["ss"] = int(pt_regs["ss"])
++        regs["rbp"] = int(pt_regs["bp"])
++        regs["rax"] = int(pt_regs["ax"])
++        regs["rbx"] = int(pt_regs["bx"])
++        regs["rcx"] = int(pt_regs["cx"])
++        regs["rdx"] = int(pt_regs["dx"])
++        regs["rsi"] = int(pt_regs["si"])
++        regs["rdi"] = int(pt_regs["di"])
++        regs["rip"] = int(pt_regs["ip"])
++        regs["rsp"] = int(pt_regs["sp"])
++
++        return regs
++
++    @staticmethod
++    def write_to_json(rootpgt, thread, loadaddr, filename):
++        """given information generate json file"""
++        dic = {"rootpgt": rootpgt, "loadaddr": loadaddr, "threads": thread}
++        with open(filename, 'w') as json_file:
++            json.dump(dic, json_file, indent=4)
++
++    def invoke(self, arg, from_tty):
++        args = arg.split(" ")
++
++        arch = gdb.inferiors()[0].architecture().name()
++        thread_reg_func = self.ARCH_USR_REGS_FUNC[arch]
++
++        filename = args[0]
++        filename = os.path.expanduser(filename)
++        pid = args[1]
++        task = KdumpGdbserverMakeProcessJson.findtask(pid)
++        if task == None:
++            print("No task with pid", pid, "use kdump-kernel-ps to find available pids")
++        else:
++            pid = int(task["pid"])
++            rootpgt = int(task["mm"]["pgd"])
++            loadaddr = int(KdumpGdbserverMakeProcessJson.get_first_exec_addr(task))
++            threads = []
++            task_type = gdb.parse_and_eval("init_task").type
++            for ctask in KdumpGdbserverBase.kernellist(task["thread_group"], "thread_group", task_type, include_first=True):
++                regs = thread_reg_func(ctask)
++                threads = KdumpGdbserverBase.get_thread_info(ctask, pid, regs, threads)
++            KdumpGdbserverMakeProcessJson.write_to_json(rootpgt, threads, loadaddr, filename)
++
++
++class KdumpGdbserverMakeKernelJson(gdb.Command):
++    """generates kdump-gdbserver kernel json file
++
++This command given a file name will generate a json file
++containing information necessary for kdump-gdbserver to run
++in kernel with tasks mode, i.e where all kernel tasks
++presented as threads
++
++usage: kdump-save-kernel-json <filename>"""
++
++    def __init__(self):
++        super(KdumpGdbserverMakeKernelJson, self).__init__("kdump-save-kernel-json",
++                                                           gdb.COMMAND_USER,
++                                                           gdb.COMPLETE_FILENAME)
++        self.ARCH_KER_REGS_FUNC = {
++            "aarch64": KdumpGdbserverMakeKernelJson.get_thread_regs_ker_aarch64,
++            "i386:x86-64": KdumpGdbserverMakeKernelJson.get_thread_regs_ker_x86_64,
++        }
++
++    @staticmethod
++    def get_thread_regs_ker_aarch64(task):
++        """read kernel task registers used by scheduler for aarch64 architecture"""
++        cpu_context = task["thread"]["cpu_context"]
++        regs = {}
++        for x in range(31):
++            reg_num = "x%d" % (x)
++            try:
++                regs[reg_num] = int(cpu_context[reg_num])
++            except gdb.error:
++                pass
++        regs["x29"] = int(cpu_context["fp"])
++        regs["sp"] = int(cpu_context["sp"])
++        regs["pc"] = int(cpu_context["pc"])
++        return regs
++
++    @staticmethod
++    def get_thread_regs_ker_x86_64(task):
++        """read kernel task registers used by scheduler for x86_64 architecture"""
++        thread = task["thread"]
++        rsp = thread["sp"]
++        inactive_task_frame_p_type = gdb.lookup_type("struct inactive_task_frame").pointer()
++        frame = rsp.cast(inactive_task_frame_p_type)
++
++        regs = {}
++        regs["rsp"] = int(rsp)
++        regs["rip"] = int(frame['ret_addr'])
++        regs['rbp'] = int(frame['bp'])
++        regs['rbx'] = int(frame['bx'])
++        regs['r12'] = int(frame['r12'])
++        regs['r13'] = int(frame['r13'])
++        regs['r14'] = int(frame['r14'])
++        regs['r15'] = int(frame['r15'])
++        return regs
++
++    @staticmethod
++    def write_to_json(thread, filename):
++        """given information generate json file"""
++        dic = {"threads": thread}
++        with open(filename, 'w') as json_file:
++            json.dump(dic, json_file, indent=4)
++
++    def invoke(self, arg, from_tty):
++        args = arg.split(" ")
++        filename = args[0]
++        filename = os.path.expanduser(filename)
++        arch = gdb.inferiors()[0].architecture().name()
++        thread_reg_func = self.ARCH_KER_REGS_FUNC[arch]
++
++        init_task = gdb.parse_and_eval("init_task")
++        threads = []
++        task_type = init_task.type
++        for task in KdumpGdbserverBase.kernellist(init_task["tasks"], "tasks", task_type, include_first=True):
++            pid = int(task["pid"])
++            for ctask in KdumpGdbserverBase.kernellist(task["thread_group"], "thread_group", task_type,
++                                                       include_first=True):
++                regs = thread_reg_func(ctask)
++                threads = KdumpGdbserverBase.get_thread_info(ctask, pid, regs, threads)
++        KdumpGdbserverMakeKernelJson.write_to_json(threads, filename)
++
++
++KdumpGdbserverKernelPs()
++KdumpGdbserverMakeProcessJson()
++KdumpGdbserverMakeKernelJson()
+diff --git a/gdbserver/README.md b/gdbserver/README.md
+new file mode 100644
+index 0000000..1d366f2
+--- /dev/null
++++ b/gdbserver/README.md
+@@ -0,0 +1,337 @@
++kdump-gdbserver
++===============
++
++Introduction
++------------
++
++kdump-gdbserver is a symbol debugging tool similar to
++[crash](https://github.com/crash-utility/crash.git) or
++[crash-python](https://github.com/crash-python/crash-python).
++It allows inspection of kernel crash dump file (aka
++kernel vmcore) with gdb. It uses
++[gdb remote debugging protocol](https://sourceware.org/gdb/current/onlinedocs/gdb/Remote-Protocol.html)
++to convey information from vmcore file to gdb. Typical usage pattern is to start
++kdump-gdbserver with a certain vmcore file. Kdump-gdbserver will be listening on a
++port and then connect via gdb 'target remote' command.
++
++kdump-gdbserver server can operate in one of the three following modes:
++
++1. kernel - primary mode, gdb can read kernel memory translated through the
++kernel page table, and each cpu core is presented as a separate thread
++
++2. kernel with tasks - same as kernel mode but also all kernel tasks will be
++presented as threads. To operate in this mode kdump-gdbserver needs
++information about all kernel tasks registers which is passed in an additional
++json file that should be generated in kernel mode.
++
++3. process mode - if vmcore contains user-land processes pages kdump-gdbserver
++can present this process address space and its threads. It would present the
++same view to gdb as one can get from regular user-land process core. And it
++could be done for any user-land process present in kernel crash moment. Similar
++to kernel with tasks mode this mode also requires a json file with additional
++information that can be generated in kernel mode.
++
++In order to extract information needed for kernel with tasks mode and process mode
++KdumpGdbCommands.py python script is provided. How to use script to extract correct
++data is detailed in each relevant mode's section.
++
++Kernel Mode
++-----------
++
++Start kdump-gdbserver and provide path to vmcore with -f option:
++
++    $ kdump-gdbserver -f vmcore
++    Waiting for incoming connection on localhost port 1234
++    In gdb execute the following command(s) to connect:
++    file <vmlinux> -o 0x9200000
++    target remote localhost:1234
++
++
++Start proper gdb and execute commands suggested by kdump-gdbserver. Use vmlinux
++kernel symbol file that corresponds to given vmcore file.
++
++    $ gdb
++    <snip>
++    (gdb) file vmlinux -o 0x2b200000
++    Reading symbols from vmlinux...
++    (gdb) target remote localhost:1234
++    Remote debugging using localhost:1234
++    crash_setup_regs (oldregs=<optimized out>, newregs=<optimized out>)
++        at ./arch/x86/include/asm/kexec.h:95
++    95			asm volatile("movq %%rbx,%0" : "=m"(newregs->bx));
++    (gdb) bt
++    #0  crash_setup_regs (oldregs=<optimized out>, newregs=<optimized out>) at ./arch/x86/include/asm/kexec.h:95
++    #1  __crash_kexec (regs=0x0) at kernel/kexec_core.c:958
++    #2  0xffffffffac275a88 in panic (fmt=0xffffffffad47a7c9 "sysrq triggered crash\n") at kernel/panic.c:251
++    #3  0xffffffffac8a552a in sysrq_handle_crash (key=<optimized out>) at drivers/tty/sysrq.c:153
++    #4  0xffffffffac8a5f17 in __handle_sysrq (key=99, check_mask=false) at drivers/tty/sysrq.c:571
++
++    $ gdb
++    <snip>
++    (gdb) file vmlinux -o 0x9200000
++    Reading symbols from vmlinux...
++    (gdb) target remote localhost:1234
++    Remote debugging using localhost:1234
++    crash_setup_regs (oldregs=<optimized out>, newregs=<optimized out>) at /usr/src/kernel/arch/x86/include/asm/kexec.h:95
++    95	/usr/src/kernel/arch/x86/include/asm/kexec.h: No such file or directory.
++    (gdb) bt
++     #0  crash_setup_regs (oldregs=<optimized out>, newregs=<optimized out>) at /usr/src/kernel/arch/x86/include/asm/kexec.h:95
++     #1  __crash_kexec (regs=0x0) at /usr/src/kernel/kernel/kexec_core.c:958
++     #2  0xffffffff8a275e98 in panic (fmt=0xffffffff8b47af59 "sysrq triggered crash\n") at /usr/src/kernel/kernel/panic.c:251
++     #3  0xffffffff8a8a547a in sysrq_handle_crash (key=<optimized out>) at /usr/src/kernel/drivers/tty/sysrq.c:153
++     #4  0xffffffff8a8a5e67 in __handle_sysrq (key=99, check_mask=false) at /usr/src/kernel/drivers/tty/sysrq.c:571
++
++
++Note in this example kernel was operating in KASLR mode so it is important to use
++'-o' option in file command with value suggested by kdump-gdbserver. It is
++extracted from vmcore VMCOREINFO note KERNELOFFSET value.
++
++Now you can inspect state of kernel crash! For example we can see what was executing
++on other cores:
++
++    (gdb) info threads
++    Id   Target Id                   Frame
++    * 1    Thread 1.1 (CPU #0 pid 386) crash_setup_regs (oldregs=<optimized out>, newregs=<optimized out>)
++        at /usr/src/kernel/arch/x86/include/asm/kexec.h:95
++    2    Thread 1.2 (CPU #1 idle)    mwait_idle () at /usr/src/kernel/arch/x86/kernel/process.c:806
++    3    Thread 1.3 (CPU #2 idle)    0xffffffff8a2a763e in preempt_count_add (val=1)
++        at /usr/src/kernel/arch/x86/include/asm/preempt.h:26
++    4    Thread 1.4 (CPU #3 idle)    mwait_idle () at /usr/src/kernel/arch/x86/kernel/process.c:806
++
++Kernel with Tasks
++-----------------
++
++Sometimes one would want to see backtrace and investigate stack state of
++specific kernel tasks. All required information, task data and their
++register sets are in vmcore but it needs to be extracted using kernel symbolic
++information. For this purpose KdumpGdbCommands.py gdb python script is provided.
++
++In simple kernel mode the script needs to be sourced:
++
++    (gdb) source KdumpGdbCommands.py
++
++And kdump-save-kernel-json command should be used to generate kernel tasks state
++json file:
++
++    (gdb) kdump-save-kernel-json kernel-tasks.json
++
++After that exit from Kdump-gdbserver and restart it with additional option. Provide
++the json file that was generated with -k command line option:
++
++    $ kdump-gdbserver -f vmcore -k kernel-tasks.json
++    Waiting for incoming connection on localhost port 1234
++    In gdb execute the following command(s) to connect:
++    file <vmlinux> -o 0x9200000
++    target remote localhost:1234
++
++Now you can see all kernel tasks loaded as threads in gdb:
++
++    (gdb) info threads
++    Id   Target Id                                         Frame
++    * 1    Thread 1.1 (pid 386 LWP 386 "sh")                 crash_setup_regs (oldregs=<optimized out>, newregs=<optimized out>)
++        at /usr/src/kernel/arch/x86/include/asm/kexec.h:95
++      2    Thread 1.2 (pid 0 LWP 0 "[swapper/0]")            mwait_idle () at /usr/src/kernel/arch/x86/kernel/process.c:806
++      3    Thread 1.3 (pid 0 LWP 0 "[swapper/0]")            0xffffffff8a2a763e in preempt_count_add (val=1)
++        at /usr/src/kernel/arch/x86/include/asm/preempt.h:26
++      4    Thread 1.4 (pid 0 LWP 0 "[swapper/0]")            mwait_idle () at /usr/src/kernel/arch/x86/kernel/process.c:806
++      5    Thread 1.5 (pid 1 LWP 1 "init")                   0xffffffff8ade1feb in context_switch (rf=<optimized out>,
++        next=<optimized out>, prev=<optimized out>, rq=<optimized out>) at /usr/src/kernel/kernel/sched/core.c:3546
++      6    Thread 1.6 (pid 2 LWP 2 "[kthreadd]")             0xffffffff8ade1feb in context_switch (rf=<optimized out>,
++        next=<optimized out>, prev=<optimized out>, rq=<optimized out>) at /usr/src/kernel/kernel/sched/core.c:3546
++      7    Thread 1.7 (pid 3 LWP 3 "[rcu_gp]")               0xffffffff8ade1feb in context_switch (rf=<optimized out>,
++    <snip>
++      84   Thread 1.84 (pid 311 LWP 311 "[nfsd]")            0xffffffff8ade1feb in context_switch (rf=<optimized out>,
++        next=<optimized out>, prev=<optimized out>, rq=<optimized out>) at /usr/src/kernel/kernel/sched/core.c:3546
++
++Inspect task stack at will:
++
++    (gdb) thread 84
++    [Switching to thread 84 (Thread 1.84)]
++    #0  0xffffffff8ade1feb in context_switch (rf=<optimized out>, next=<optimized out>, prev=<optimized out>,
++        rq=<optimized out>) at /usr/src/kernel/kernel/sched/core.c:3546
++    3546	in /usr/src/kernel/kernel/sched/core.c
++    (gdb) bt
++    #0  0xffffffff8ade1feb in context_switch (rf=<optimized out>, next=<optimized out>, prev=<optimized out>,
++        rq=<optimized out>) at /usr/src/kernel/kernel/sched/core.c:3546
++    #1  __schedule (preempt=<optimized out>) at /usr/src/kernel/kernel/sched/core.c:4307
++    #2  0xffffffff8ade23ef in schedule () at /usr/src/kernel/kernel/sched/core.c:4382
++    #3  0xffffffff8ade5a60 in schedule_timeout (timeout=<optimized out>) at /usr/src/kernel/kernel/time/timer.c:1916
++    #4  0xffffffff8adbfda9 in svc_get_next_xprt (timeout=<optimized out>, rqstp=<optimized out>)
++        at /usr/src/kernel/net/sunrpc/svc_xprt.c:733
++    #5  svc_recv (rqstp=0xffffa08dec59c000, timeout=<optimized out>) at /usr/src/kernel/net/sunrpc/svc_xprt.c:850
++
++
++Process
++-------
++
++If kernel dump file was captured with user data pages information about any process
++state is all there. kdump-gdbsever can use process specific page table root, find
++user-land threads registers and present process core view as one would get from
++regular core file. Similar to kernel with tasks mode this additional information
++must be extracted. For this purpose use the KdumpGdbCommands.py gdb python script
++provided.
++
++In simple kernel mode the script needs to be sourced:
++
++    (gdb) source KdumpGdbCommands.py
++
++To find the PID of the process you want to debug use kdump-kernel-ps command
++
++    (gdb) kdump-kernel-ps
++    UID        PID        PPID       LWP        COMM                      ADDRESS
++    0          0          0          0          [swapper/0]               0xffffffff8b612840
++    0          1          0          1          init                      0xffffa08dff9b8000
++    0          2          0          2          [kthreadd]                0xffffa08dff9b8c00
++    0          3          2          3          [rcu_gp]                  0xffffa08dff9b9800
++    0          4          2          4          [rcu_par_gp]              0xffffa08dff9ba400
++    0          5          2          5          [kworker/0:0]             0xffffa08dff9bb000
++    <snip>
++    0          350        1          350        getty                     0xffffa08debe86c00
++    0          385        349        385        getty                     0xffffa08dff371800
++    0          386        348        386        sh                        0xffffa08dff088c00
++
++Once you know the PID of the process you want to debug run the kdump-save-process-json
++command to create process json file:
++
++    (gdb) kdump-save-process-json process-386.json 386
++
++After that exit from both kdump-gdbserver and gdb. Restart kdump-gdbserver and
++provide the json file that was generated with -j command line option:
++
++    $ kdump-gdbserver -f vmcore -j process-386.json
++    Waiting for incoming connection on localhost port 1234
++    In gdb execute the following command(s) to connect:
++    # If you use PIE executable use the following command to correctly
++    # load process symbols
++    file <executable> -o 0x41e000
++    target remote localhost:1234
++
++    Waiting for incoming connection on localhost port 1234
++    In gdb execute the following command(s) to connect:
++    # If you use PIE executable use the following command to correctly
++    # load process symbols
++    file <executable> -o 0x41e000
++    target remote localhost:1234
++
++Now, you can continue inspecting state of the process as one would use gdb
++connected to gdbserver attached to given process pid.
++
++    $ gdb
++    <snip>
++    (gdb) file bash
++    Reading symbols from bash...
++    (gdb) set sysroot sysroot
++    (gdb) target remote localhost:1234
++    Remote debugging using localhost:1234
++    <snip>
++    Reading symbols from sysroot/lib/libc.so.6...
++    Reading symbols from sysroot/lib/ld-linux-x86-64.so.2...
++    Reading symbols from sysroot/lib/libnss_compat.so.2...
++    0x0000003cd4cea4c3 in __GI___libc_write (fd=1, buf=0x559b10, nbytes=2) at ../sysdeps/unix/sysv/linux/write.c:26
++    26	../sysdeps/unix/sysv/linux/write.c: No such file or directory.
++    (gdb) bt
++    #0  0x0000003cd4cea4c3 in __GI___libc_write (fd=1, buf=0x559b10, nbytes=2) at ../sysdeps/unix/sysv/linux/write.c:26
++    #1  0x0000003cd4c7d835 in _IO_new_file_write (f=0x3cd4db8520 <_IO_2_1_stdout_>, data=0x559b10, n=2) at fileops.c:1176
++    #2  0x0000003cd4c7cc56 in new_do_write (fp=fp@entry=0x3cd4db8520 <_IO_2_1_stdout_>, data=0x559b10 "c\n\333\324<",
++        to_do=to_do@entry=2) at libioP.h:948
++    #3  0x0000003cd4c7e8a9 in _IO_new_do_write (to_do=2, data=<optimized out>, fp=0x3cd4db8520 <_IO_2_1_stdout_>)
++        at fileops.c:423
++    #4  _IO_new_do_write (fp=fp@entry=0x3cd4db8520 <_IO_2_1_stdout_>, data=<optimized out>, to_do=2) at fileops.c:423
++    #5  0x0000003cd4c7ed03 in _IO_new_file_overflow (f=0x3cd4db8520 <_IO_2_1_stdout_>, ch=10) at fileops.c:784
++    #6  0x0000000000483839 in putchar (__c=10) at /usr/include/bits/stdio.h:84
++    #7  echo_builtin (list=<optimized out>) at ../../bash-5.0/builtins/../../bash-5.0/builtins/echo.def:199
++    #8  0x0000000000434540 in execute_builtin (builtin=builtin@entry=0x483660 <echo_builtin>, words=words@entry=0x5597c0,
++        flags=flags@entry=0, subshell=subshell@entry=0) at ../bash-5.0/execute_cmd.c:4714
++    #9  0x000000000043951e in execute_builtin_or_function (flags=0, fds_to_close=0x559540, redirects=<optimized out>, var=0x0,
++        builtin=0x483660 <echo_builtin>, words=0x5597c0) at ../bash-5.0/execute_cmd.c:5222
++    #10 execute_simple_command (fds_to_close=0x559540, async=<optimized out>, pipe_out=-1, pipe_in=-1,
++        simple_command=<optimized out>) at ../bash-5.0/execute_cmd.c:4484
++    #11 execute_command_internal (command=<optimized out>, asynchronous=<optimized out>, pipe_in=-1, pipe_out=<optimized out>,
++        fds_to_close=0x559540) at ../bash-5.0/execute_cmd.c:844
++    #12 0x0000000000439c15 in execute_command (command=0x559960) at ../bash-5.0/execute_cmd.c:394
++    #13 0x000000000042160b in reader_loop () at ../bash-5.0/eval.c:175
++    #14 0x00000000004204ae in main (argc=1, argv=0x7fff27982898, env=0x7fff279828a8) at ../bash-5.0/shell.c:805
++    (gdb) frame 12
++    #12 0x0000000000439c15 in execute_command (command=0x559960) at ../bash-5.0/execute_cmd.c:394
++    394	in ../bash-5.0/execute_cmd.c
++    (gdb) p *command->value.Simple->words->word
++    $8 = {word = 0x5597a0 "echo", flags = 0}
++    (gdb) p *command->value.Simple->words->next->word
++    $9 = {word = 0x559920 "\"c\"", flags = 2}
++
++Note if you did not compile the process with PIE do NOT use -o when executing
++file command in gdb. If you do the symbols won't be loaded correctly. You can
++find whether your executable is built with PIE or not with 'file executable'
++command. If it says ELF file is 'executable', then it is not PIE. If it says
++ELF 'shared object' it is PIE built executable and -o must be used. With
++regular gdbserver and PIE executable, gdbsever during run-time reads content of
++/proc/pid/maps file and determine executable load address, in kdump-gdbserver
++gdb protocol remote file read is not supported. In above example bash is not
++PIE so -o option was not used.
++
++Note you need to setup the proper environment to load symbols as one would do
++for a regular process core file, i.e like in the above example cross
++compilation was used and one need to execute 'set sysroot' command to point
++to target symbols.
++
++Supported CPU Architectures
++---------------------------
++
++kdump-gdbserver supports x86_64 and aarch64 CPU architectures. To add a new
++CPU architecture one needs to make sure that libkdumpfile supports it, and
++small CPU arch specific code needs to be added in a few places.
++
++Rational
++--------
++
++Why does one need another tool to inspect kernel vmcore files? Here are the
++reasons that prompted development of kdump-gdbserver tool:
++
++1. [gdb](https://www.gnu.org/software/gdb/)
++On many CPU architectures only directly mapped memory can be inspected
++with vanilla gdb, from a given vmcore file if it is captured in the ELF format,
++i.e gdb is not aware of the kernel page table and cannot easily look at memory
++that goes through kernel page table translation. And gdb does not understand
++compressed kdump file format.
++
++2. [crash](https://github.com/crash-utility/crash.git)
++is a variant of gdb where code translating kernel virtual addresses into
++physical addresses in vmcore was developed. It adds more functionality, but at
++time of writing gdb version on which crash tool is based is quite old and
++it does not support python scripting in gdb.
++
++3. [crash-python](https://github.com/crash-python/crash-python)
++tools that utilizes the same libkdumpfile library does understand
++kernel virtual memory, it does present kernel tasks as threads as
++kdump-gdbserver kernel with tasks mode does. Also similar to crash tool many
++useful command are provided by the tool. But the tool depends on a modified
++version of gdb
++[gdb-python](https://github.com/crash-python/gdb-python)
++where additional gdb python functionality is added. At time of writing
++gdb-python is based on gdb-9.2.x. Without upstreaming those patches into
++mainstream gdb there is a risk that version of underlying gdb of gdb-python
++would be stuck in the past similar to crash tool stuck on old gdb version.
++
++kdump-gdbserver uses gdb remote protocol between the tool and gdb. It should
++continue to work with future versions of gdb, so effectively the tool is
++independent from gdb version.
++
++Also kdump-gdbserver source code is very small. It contains the bare minimum
++gdb protocol implementation, naturally just the state reading part. Most of
++the magic, reading vmcore file, translating virtual to physical addresses,
++VMCOREINFO note access is all done by libkdumpfile library. So mapping gdb
++protocol to proper libkdumpfile was not a big deal.
++
++Note additional functionality to easily inspect kernel state could be added as
++gdb python commands, and those would work with kdump-gdbserver and live kernel
++gdb sessions in the same way.
++
++Finally, kdump-gdbserver tool supports process view where state of the
++user-land process can be inspected with gdb from given vmcore file if user
++pages are present.
++
++TODO
++----
++
++- Support 32bit user-land process
++- Support more CPU architectures
+diff --git a/gdbserver/kdump-gdbserver b/gdbserver/kdump-gdbserver
+new file mode 100755
+index 0000000..ffd3af4
+--- /dev/null
++++ b/gdbserver/kdump-gdbserver
+@@ -0,0 +1,619 @@
++#!/usr/bin/env python3
++
++import socket
++import sys
++import re
++import argparse
++import json
++import addrxlat
++
++from kdumpfile import kdumpfile, KDUMP_KVADDR, attr_dir
++from kdumpfile.exceptions import AddressTranslationException, NoDataException
++
++class VmcoreBase:
++    """
++    Base class for reading information from vmcore file
++    has methods shared by all classes who read from vmcore
++    file
++    """
++    def __init__(self, filename):
++        self.filename = filename
++        self.kdump = kdumpfile(file=self.filename)
++        self.kdump.attr["addrxlat.ostype"] = "linux"
++        self.arch = self.kdump.attr["arch.name"]
++
++        self.threads_registers = {}
++        self.threads_extra_info = {}
++
++        self.default_pid = 1
++        self.load_address = None
++        self.pidtid = None
++
++    def read_memory(self, address, size):
++        try:
++            return self.kdump.read(KDUMP_KVADDR, address, size)
++        except(AddressTranslationException, NoDataException):
++            return None
++
++    def get_regs(self, reg_spec):
++        # note we ignore reg_spec
++        return self.threads_registers[self.pidtid]
++
++    def get_threads(self):
++        """returns iterator of all thread pid tid pairs"""
++        return iter(self.threads_registers.keys())
++
++    def set_current_thread(self, pid, tid):
++        pidtid = (pid, tid)
++        if pidtid in self.threads_registers.keys():
++            self.pidtid = pidtid
++
++    def thread_is_alive(self, pid, tid):
++        pidtid = (pid, tid)
++        if pidtid in self.threads_registers.keys():
++            return True
++        else:
++            return False
++
++    def get_current_pid_and_tid(self):
++        return self.pidtid
++
++    def get_thread_extra_info(self, pid, tid):
++        return self.threads_extra_info[(pid, tid)]
++
++    def get_arch(self):
++        return self.arch
++
++    def get_load_address(self):
++        return self.load_address
++
++    def get_default_pid(self):
++        return self.default_pid
++
++
++class VmcoreKernel(VmcoreBase):
++    """
++    Class for reading kernel space information
++    uses vmcore base and performs kernel specific
++    set up
++    """
++    def __init__(self, filename, jsonfile=None):
++        super(VmcoreKernel, self).__init__(filename)
++
++        try:
++            self.load_address = int(self.kdump.attr["linux.vmcoreinfo.lines.KERNELOFFSET"], 16)
++        except KeyError:
++            self.load_address = 0
++
++        self.__arch_reg_fixup = {
++            "aarch64": self.reg_fixup_aarch64,
++            "x86_64": self.reg_fixup_x86_64,
++        }
++
++        num_cpu = self.kdump.attr["cpu.number"]
++
++        if jsonfile:
++            # we got json file show all kernel task as threads mode
++
++            # load data from json file
++            with open(jsonfile) as f:
++                self.proc_data = json.load(f)
++
++            active_pids = []
++
++            # first process registers from prstatus
++            for cpu in range(num_cpu):
++                prstatus_regs = self.kdump.attr["cpu"][str(cpu)]["reg"]
++                regs = prstatus_regs.copy()
++                self.__arch_reg_fixup[self.arch](regs)
++
++                pidtid = (1, cpu + 1)
++                self.threads_registers[pidtid] = regs
++
++                pid = self.kdump.attr["cpu"][str(cpu)]["pid"]
++
++                # if pid in prstatus is not 0 set it as active
++                if pid != 0:
++                    self.pidtid = pidtid
++
++                # find active pid in json
++                for thread in self.proc_data["threads"]:
++                    # note in json pid of task_struct saved as tid
++                    tid = thread["tid"]
++                    if tid == pid:
++                        self.threads_extra_info[pidtid] = 'pid %d LWP %d "%s"' % (tid, tid, thread["comm"])
++                        active_pids.append(pid)
++
++            # add regsiters from json file
++            thread_count = num_cpu + 1
++            for thread in self.proc_data["threads"]:
++                # note in json pid of task_struct saved as tid, pid is pid of leading task_struct
++                pid = thread["pid"]
++                tid = thread["tid"]
++                if tid not in active_pids:
++                    pidtid = (1, thread_count)
++                    self.threads_registers[pidtid] = thread["registers"]
++                    self.threads_extra_info[pidtid] =  'pid %d LWP %d "%s"' % (pid, tid, thread["comm"])
++                    thread_count = thread_count + 1
++        else:
++            # only CPU cores as threads mode
++            for cpu in range(num_cpu):
++                pre_regs = self.kdump.attr["cpu"][str(cpu)]["reg"]
++                regs = pre_regs.copy()
++                self.__arch_reg_fixup[self.arch](regs)
++                pidtid = (1, cpu+1)
++                self.threads_registers[pidtid] = regs
++                pid = self.kdump.attr["cpu"][str(cpu)]["pid"]
++                if pid != 0:
++                    self.threads_extra_info[pidtid] = "CPU #%x pid %d" % (cpu, pid)
++                else:
++                    self.threads_extra_info[pidtid] = "CPU #%x idle" % (cpu)
++
++                pid = self.kdump.attr["cpu"][str(cpu)]["pid"]
++
++                # if pid in prstatus is not 0 set it as active
++                if pid != 0:
++                    self.pidtid = pidtid
++
++        if not self.pidtid:
++            self.pidtid = (1, 1)
++
++    def reg_fixup_aarch64(self, regs):
++        regs["x30"] = regs["lr"]
++        regs["cpsr"] = regs["pstate"]
++
++    def reg_fixup_x86_64(self, regs):
++        regs["eflags"] = regs["rflags"]
++
++
++class VmcoreProcess(VmcoreBase):
++    """
++    Class for reading user space information
++    uses vmcore base and performs user space specific
++    set up
++    """
++    def __init__(self, filename, proc_json_file):
++        super(VmcoreProcess, self).__init__(filename)
++
++        # collect active pids
++        active_pids = []
++        num_cpu = self.kdump.attr["cpu.number"]
++        for cpu in range(num_cpu):
++            pid = self.kdump.attr["cpu"][str(cpu)]["pid"]
++            active_pids.append(pid)
++
++        # load data from json file
++        self.proc_json_file = proc_json_file
++        with open(self.proc_json_file) as f:
++            self.proc_data = json.load(f)
++
++        # translate process pgt kernel virtual address into physical
++        rootpgt_virt = self.proc_data["rootpgt"]
++        self.load_address = self.proc_data["loadaddr"]
++        system = self.kdump.get_addrxlat_sys()
++        ctx = self.kdump.get_addrxlat_ctx()
++
++        fulladdr = addrxlat.FullAddress(addrxlat.KVADDR, rootpgt_virt)
++        fulladdr.conv(addrxlat.KPHYSADDR, ctx, system)
++        rootpgt = fulladdr.addr
++
++        # set our process rootpgt
++        system.os_init(ctx=ctx, arch=self.arch, type=1, opts="rootpgt=KPHYSADDR:0x%x" % (rootpgt))
++
++        # our default pid
++        self.default_pid = self.proc_data["threads"][0]["pid"]
++
++        # fill threads registers and extra info
++        for thread in self.proc_data["threads"]:
++            tid = thread["tid"]
++            pid = thread["pid"]
++            pidtid = (pid, tid)
++            self.threads_registers[pidtid] = thread["registers"]
++            self.threads_extra_info[pidtid] = 'pid %d LWP %d "%s"' % (pid, tid, thread["comm"])
++            if tid in active_pids:
++                self.pidtid = pidtid
++
++        # if none of our threads were active set last one as current
++        if not self.pidtid:
++            self.pidtid = pidtid
++
++
++class GdbServer:
++    """
++    Class that reads interprets gdb remote protocol and
++    interface with class that reads from vmcore
++    """
++    M_PACKET = "^m([0-9a-f]+)\,([0-9a-f]+)$"
++    H_PACKET = "^H[a-z](p?[0-9a-f\.]+)$"
++    T_PACKET = "^T(p?[0-9a-f\.]+)$"
++    Q_SUPPORTED_PACKET = "^qSupported:(.+)$"
++    Q_ATTACHED_PACKET = "^qAttached:(.+)$"
++    D_PID_PACKET = "^D;[0-9a-f]+$"
++    VKILL_PACKET = "^vKill;(p?[0-9a-f\.]+)$"
++    T_INFO_PACKET = "^qThreadExtraInfo,(p?[0-9a-f\.]+)$"
++
++    ARCH_REGS = {
++        "aarch64": (
++            ("x0", 8),
++            ("x1", 8),
++            ("x2", 8),
++            ("x3", 8),
++            ("x4", 8),
++            ("x5", 8),
++            ("x6", 8),
++            ("x7", 8),
++            ("x8", 8),
++            ("x9", 8),
++            ("x10", 8),
++            ("x11", 8),
++            ("x12", 8),
++            ("x13", 8),
++            ("x14", 8),
++            ("x15", 8),
++            ("x16", 8),
++            ("x17", 8),
++            ("x18", 8),
++            ("x19", 8),
++            ("x20", 8),
++            ("x21", 8),
++            ("x22", 8),
++            ("x23", 8),
++            ("x24", 8),
++            ("x25", 8),
++            ("x26", 8),
++            ("x27", 8),
++            ("x28", 8),
++            ("x29", 8),
++            ("x30", 8),
++            ("sp", 8),
++            ("pc", 8),
++            ("cpsr", 4),
++        ),
++        "x86_64": (
++            ("rax", 8),
++            ("rbx", 8),
++            ("rcx", 8),
++            ("rdx", 8),
++            ("rsi", 8),
++            ("rdi", 8),
++            ("rbp", 8),
++            ("rsp", 8),
++            ("r8", 8),
++            ("r9", 8),
++            ("r10", 8),
++            ("r11", 8),
++            ("r12", 8),
++            ("r13", 8),
++            ("r14", 8),
++            ("r15", 8),
++            ("rip", 8),
++            ("eflags", 4),
++            ("cs", 4),
++            ("ss", 4),
++            ("ds", 4),
++            ("es", 4),
++            ("fs", 4),
++            ("gs", 4),
++        ),
++    }
++
++    FORMAT_SPEC = {
++        4: "%8.8x",
++        8: "%16.16x",
++        10: "%20.20x",
++        16: "%32.32x",
++    }
++
++    def __init__(self, backend, hostname, port, debug=False):
++        self.simple_commands = {
++            "g": self.get_registers,
++            "qfThreadInfo": self.get_thread_info,
++            "qsThreadInfo": self.get_thread_info,
++            "vMustReplyEmpty": self.return_empty,
++            "Hc-1": self.return_ok,
++            "?": self.get_status,
++            "D": self.close_connection,
++            "k": self.close_connection,
++        }
++        # put most frequent packets first
++        self.regex_commands = (
++            (re.compile(GdbServer.M_PACKET), self.get_memory),
++            (re.compile(GdbServer.H_PACKET), self.switch_thread),
++            (re.compile(GdbServer.T_PACKET), self.thread_alive),
++            (re.compile(GdbServer.Q_SUPPORTED_PACKET), self.check_supported),
++            (re.compile(GdbServer.T_INFO_PACKET), self.get_extra_thread_info),
++            (re.compile(GdbServer.D_PID_PACKET), self.close_connection),
++            (re.compile(GdbServer.VKILL_PACKET), self.close_connection),
++            (re.compile(GdbServer.Q_ATTACHED_PACKET), self.check_attached),
++        )
++
++        self.backend = backend
++        self.hostname = hostname
++        self.port = port
++        self.debug = debug
++
++        self.threads = None
++        self.running = False
++        self.multiprocess = False
++
++        arch = self.backend.get_arch()
++        self.reg_spec = GdbServer.ARCH_REGS[arch]
++
++    def threadid2str(self, pid, tid):
++        if self.multiprocess:
++            return "p%x.%x" % (pid, tid)
++        else:
++            return "%x" % (tid)
++
++    def str2threadid(self, string):
++        ret = (0, 0)
++        if self.multiprocess and string[0] == "p":
++            pidtid = string[1:].split('.')
++            if len(pidtid) == 2:
++                ret = (int(pidtid[0], 16), int(pidtid[1], 16))
++        else:
++            ret = (self.backend.get_default_pid(), int(string, 16))
++        return ret
++
++    def get_registers(self, command):
++        regs = self.backend.get_regs(self.reg_spec)
++
++        reply = ""
++        for regspec in self.reg_spec:
++            name, size = regspec
++
++            if name in regs:
++                value = regs[name]
++                nvalue =  value.to_bytes(size, "big")
++                nvalue = int.from_bytes(nvalue, "little")
++                reg_str = GdbServer.FORMAT_SPEC[size] % nvalue
++            else:
++                reg_str = "x" * (size * 2)
++
++            reply = reply + reg_str
++        return reply
++
++    def get_thread_info(self, command):
++        if command == "qfThreadInfo":
++            self.threads = self.backend.get_threads()
++            pid, tid = next(self.threads)
++            return "m" + self.threadid2str(pid, tid)
++        else:
++            try:
++                pid, tid = next(self.threads)
++                return "m" + self.threadid2str(pid, tid)
++            except(StopIteration):
++                return "l"
++
++    def return_empty(self, command):
++        return ""
++
++    def return_ok(self, command):
++        return "OK"
++
++    def get_status(self, command):
++        pid, tid = self.backend.get_current_pid_and_tid()
++        # note hardcoded signal SIGTRAP
++        return "T05thread:%s;" % (self.threadid2str(pid, tid))
++
++    def close_connection(self, command):
++        self.running = False
++        if command == "k":
++            return ""
++        else:
++            return "OK"
++
++    def get_memory(self, command):
++        address = int(command.group(1), 16)
++        size = int(command.group(2), 16)
++        data = self.backend.read_memory(address, size)
++        if data:
++            reply = "".join(["%2.2x" % b for b in data])
++        else:
++            reply = "E14"
++        return reply
++
++    def switch_thread(self, command):
++        pid, tid = self.str2threadid(command.group(1))
++        self.backend.set_current_thread(pid, tid)
++        return "OK"
++
++    def thread_alive(self, command):
++        pid, tid = self.str2threadid(command.group(1))
++        if self.backend.thread_is_alive(pid, tid):
++            return "OK"
++        else:
++            return "E03"
++
++    def check_supported(self, command):
++        reply = ""
++        features = command.group(1).split(";")
++        if "multiprocess+" in features:
++            self.multiprocess = True
++            reply = reply + "multiprocess+"
++        return reply
++
++    def check_attached(self, command):
++        reply = "1"
++        return reply
++
++    def get_extra_thread_info(self, command):
++        pid, tid = self.str2threadid(command.group(1))
++        reply = self.backend.get_thread_extra_info(pid, tid)
++        reply = bytes(reply, "ascii")
++        return "".join(["%2.2x" % b for b in reply])
++
++    def run(self):
++        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listen_sock:
++            listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++            listen_sock.bind((self.hostname, self.port))
++            listen_sock.listen()
++
++            client_sock, client_ip = listen_sock.accept()
++            conn = client_sock.makefile('rwb')
++
++            with client_sock:
++                print('Connection from', client_ip)
++                self.running = True
++                while self.running:
++                    packet = self.get_packet(conn)
++                    if packet:
++                        if packet != b"ERROR":
++                            conn.write(b"+")
++                            conn.flush()
++                            if self.debug:
++                                print("Packet received:", packet.decode("ascii"))
++
++                            reply = self.process_packet(packet)
++                            reply = "$" + reply+self.calculate_checksum(bytes(reply, "ascii"))
++                            if self.debug:
++                                print("Sending packet:", reply)
++
++                            conn.write(bytes(reply, "ascii"))
++                            conn.flush()
++
++                            if not self.running:
++                                print("Closing connection")
++                                client_sock.close()
++                                listen_sock.close()
++                        else:
++                            conn.write(b"-")
++                            conn.flush()
++                    else:
++                        print("Lost connection")
++                        self.running = False
++                        client_sock.close()
++                        listen_sock.close()
++
++    def get_packet(self,  conn):
++        checksum = 0
++        packet = b''
++
++        while True:
++            byte = conn.read(1)
++            if len(byte) != 1:
++                return None
++
++            int_byte = int.from_bytes(byte, "big")
++            if int_byte == ord('$'):
++                break
++
++        while True:
++            byte = conn.read(1)
++            if len(byte) != 1:
++                return None
++
++            int_byte = int.from_bytes(byte, "big")
++
++            if int_byte != ord('#'):
++                packet = packet + byte
++                checksum = (checksum + int_byte) % 256
++            else:
++                p_checksum_bytes = conn.read(2)
++                if len(p_checksum_bytes) != 2:
++                    return None
++
++                p_checksum = int(p_checksum_bytes, 16)
++
++                if checksum == p_checksum:
++                    return packet
++                else:
++                    return b'ERROR'
++
++    def process_packet(self, packet):
++        packet_str = packet.decode("ascii")
++
++        if packet_str in self.simple_commands.keys():
++            return self.simple_commands[packet_str](packet_str)
++
++        for regex, action in self.regex_commands:
++            m = regex.match(packet_str)
++            if m:
++                return action(m)
++
++        return ""
++
++    def calculate_checksum(self, mbytes):
++        checksum = 0
++
++        for byte in mbytes:
++            checksum = (checksum + byte) % 256
++        ret = "#%2.2x" % (checksum)
++        return ret
++
++
++def main():
++    parser = argparse.ArgumentParser(description="""
++Reads kernel dump file (vmcore) and uses gdb remote protocol to interface with
++gdb. In gdb use 'target remote' command to connect to port on which
++kdump-gdbserver is listening. As result it allows symbolic inspection of the
++kdump file. kdump-gdbserver uses libkdumpfile library to translate memory read
++requests using va to pa translation.
++
++kdump-gdbserver server can operate in one of the three following modes:
++1. kernel - primary mode
++2. kernel with tasks - when all kernel tasks will be presented as threads.
++3. process mode - if vmcore contains user-land processes pages kdump-gdbserver
++can present this process address space and its threads.
++
++See README file for more details.""", formatter_class=argparse.RawTextHelpFormatter)
++
++    parser.add_argument("-a", "--hostname", dest="hostname", metavar="HOSTNAME",
++                        help = "Hostname to which the gdb will connect (default localhost)",
++                        default="localhost")
++
++    parser.add_argument("-p", "--port",  dest="port", metavar="PORTNUM", type=int,
++                        help = "Port which the gdb will use to connect (default 1234)",
++                        default=1234)
++
++    parser.add_argument("-f", "--vmcore", dest="corefile", metavar="FILE", type=str,
++                        required=True, help = "Corefile from which data will be read from")
++
++    parser.add_argument("-j", "--process", dest="process_json", metavar="FILE", type=str,
++                        help = "Process jsonfile, turn on process mode")
++
++    parser.add_argument("-k", "--kernelthread", dest="kernel_json", metavar="FILE", type=str,
++                        help = "Kernel threads jsonfile")
++
++    parser.add_argument("-v", "--vmlinux", dest="vmlinux", metavar="FILE", type=str,
++                        help = "Vmlinux file; needed only to generate gdb set up commands",
++                        default="<vmlinux>")
++
++    parser.add_argument("-d", "--debug", dest="debug", default=False, action='store_true',
++                        help="Turn on Debugging")
++
++    args = parser.parse_args()
++
++    #backend = SampleInferior()
++    if args.process_json:
++        backend = VmcoreProcess(args.corefile, args.process_json)
++    else:
++        backend = VmcoreKernel(args.corefile, args.kernel_json)
++
++    load_address = backend.get_load_address()
++
++    hostname = args.hostname
++    port = args.port
++
++    server = GdbServer(backend, args.hostname, args.port, args.debug)
++    print("Waiting for incoming connection on {} port {}".format(hostname, port))
++
++    # generate gdb set up instructions
++    print("In gdb execute the following command(s) to connect:")
++    if not args.process_json:
++        if load_address:
++            # note gdb 'file' command understands all the same options as
++            # 'symbol-file' command but it is not documented
++            print("file %s -o 0x%x" % (args.vmlinux, load_address))
++        elif args.vmlinux != "<vmlinux>":
++            print("file %s" % (args.vmlinux))
++    elif args.process_json:
++        print("# If you use PIE executable use the following command to correctly")
++        print("# load process symbols");
++        print("file <executable> -o 0x%x" % (load_address))
++    print("target remote %s:%d" % (hostname, port))
++
++    server.run()
++
++if __name__ == '__main__':
++    main()
+-- 
+2.26.2
+
